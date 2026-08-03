@@ -70,10 +70,20 @@ const seedAssets = Array.isArray(window.DALFILO_SEED_ASSETS)
 
 const storageKey = "dalfilo-creative-hub-v3";
 const legacyStorageKeys = ["dalfilo-creative-hub-v2", "dalfilo-creative-hub-v1"];
-let assets = loadAssets();
-let selectedId = assets[0]?.id || null;
+const FS_COLLECTION = "assets";
+const STORAGE_PREFIX = "visuals";
+const ALLOWED_DOMAIN = "dalfilo.com";
+
+// Runtime state — populated after Auth resolves
+let assets = [];
+let selectedId = null;
 let currentView = "production";
 let editingAssetId = null;
+let currentUser = null;
+let firestoreUnsub = null;
+let firstSnapshot = false;
+let saveInFlight = new Set();     // asset IDs whose Firestore write is pending
+let migrationInFlight = false;    // guard against double-run of the local→cloud migration
 
 const els = {
   rows: document.getElementById("assetRows"),
@@ -94,7 +104,7 @@ const els = {
 
 let namingTouched = false;
 
-function loadAssets() {
+function loadLocalAssets() {
   const savedAssets = parseSavedAssets(storageKey);
   if (savedAssets) return savedAssets.map(normalizeAssetDefaults);
 
@@ -143,7 +153,8 @@ function normalizeAssetDefaults(asset) {
     notes: asset.notes || "",
     performance: asset.performance || null,
     visual: asset.visual || "",
-    visualName: asset.visualName || ""
+    visualName: asset.visualName || "",
+    visualPath: asset.visualPath || ""   // Storage path (for delete/cleanup)
   };
 }
 
@@ -162,15 +173,315 @@ function mergePreservedAssetState(targetAssets, previousAssets) {
   });
 }
 
-function saveAssets() {
-  localStorage.setItem(storageKey, JSON.stringify({ assets, savedAt: new Date().toISOString() }));
+// ------- Firestore writes (single asset) -------
+async function saveAssetToFirestore(asset) {
+  const fb = window.__firebase;
+  if (!fb || !asset?.id) return;
+  saveInFlight.add(asset.id);
+  setSyncBadge("syncing", "Salvataggio…");
+  try {
+    // Strip any legacy base64 data-URL that might have leaked through (e.g. from
+    // an incomplete migration). Only http(s) URLs — pointing to Storage — belong
+    // in the document.
+    const cleanAsset = { ...asset };
+    if (cleanAsset.visual && cleanAsset.visual.startsWith("data:")) {
+      cleanAsset.visual = "";
+      cleanAsset.visualName = "";
+      cleanAsset.visualPath = "";
+    }
+    await fb.setDoc(fb.doc(fb.db, FS_COLLECTION, asset.id), cleanAsset);
+    setSyncBadge("online", "Sincronizzato");
+  } catch (err) {
+    console.error("[firestore] save failed", err);
+    setSyncBadge("error", "Errore salvataggio");
+    showToast("Errore salvataggio: " + (err.code || err.message));
+  } finally {
+    saveInFlight.delete(asset.id);
+  }
 }
 
+async function deleteAssetFromFirestore(assetId) {
+  const fb = window.__firebase;
+  if (!fb) return;
+  try {
+    await fb.deleteDoc(fb.doc(fb.db, FS_COLLECTION, assetId));
+  } catch (err) {
+    console.error("[firestore] delete failed", err);
+    showToast("Errore eliminazione: " + (err.code || err.message));
+  }
+}
+
+// Backwards-compatible name used across app.js — many places call saveAssets()
+// after mutating the local `assets` array. In the cloud world we save only the
+// affected asset. Callers that mutate a single asset should pass it explicitly;
+// callers that mutate many (import, reset, meta-CSV) call saveAssetsBulk().
+function saveAssets(target) {
+  if (target && target.id) {
+    saveAssetToFirestore(target);
+  }
+}
+
+async function saveAssetsBulk(assetList) {
+  const fb = window.__firebase;
+  if (!fb) return;
+  setSyncBadge("syncing", "Salvataggio…");
+  try {
+    let batch = fb.writeBatch(fb.db);
+    let n = 0;
+    for (const a of assetList) {
+      const cleanAsset = { ...a };
+      if (cleanAsset.visual && cleanAsset.visual.startsWith("data:")) {
+        cleanAsset.visual = "";
+        cleanAsset.visualName = "";
+        cleanAsset.visualPath = "";
+      }
+      batch.set(fb.doc(fb.db, FS_COLLECTION, a.id), cleanAsset);
+      n++;
+      if (n % 400 === 0) { await batch.commit(); batch = fb.writeBatch(fb.db); }
+    }
+    if (n % 400 !== 0) await batch.commit();
+    setSyncBadge("online", "Sincronizzato");
+  } catch (err) {
+    console.error("[firestore] bulk save failed", err);
+    setSyncBadge("error", "Errore salvataggio");
+    showToast("Errore salvataggio bulk: " + (err.code || err.message));
+  }
+}
+
+let initDone = false;
 function init() {
+  if (initDone) { render(); return; }
+  initDone = true;
   bindNavigation();
   bindActions();
   populateFilters();
   render();
+}
+
+// ============================================================================
+// AUTH
+// ============================================================================
+function setSyncBadge(state, label) {
+  const el = document.getElementById("syncBadge");
+  if (!el) return;
+  el.classList.remove("online", "offline", "error", "syncing");
+  if (state) el.classList.add(state);
+  const lbl = document.getElementById("syncLabel");
+  if (lbl) lbl.textContent = label;
+}
+
+function showAuthScreen() {
+  document.getElementById("authScreen").hidden = false;
+  document.getElementById("appShell").hidden = true;
+}
+function hideAuthScreen() {
+  document.getElementById("authScreen").hidden = true;
+  document.getElementById("appShell").hidden = false;
+}
+function showAuthError(msg) {
+  const el = document.getElementById("authError");
+  el.textContent = msg;
+  el.hidden = false;
+}
+function hideAuthError() { document.getElementById("authError").hidden = true; }
+
+function updateUserBadge(user) {
+  const badge = document.getElementById("userBadge");
+  const email = document.getElementById("userEmail");
+  if (user) {
+    badge.hidden = false;
+    email.textContent = user.email;
+  } else {
+    badge.hidden = true;
+    email.textContent = "";
+  }
+}
+
+async function doLogin() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  hideAuthError();
+  try {
+    const provider = new fb.GoogleAuthProvider();
+    provider.setCustomParameters({ hd: ALLOWED_DOMAIN, prompt: "select_account" });
+    await fb.signInWithPopup(fb.auth, provider);
+  } catch (err) {
+    console.error("[auth] login failed", err);
+    if (err.code === "auth/popup-closed-by-user" || err.code === "auth/cancelled-popup-request") return;
+    if (err.code === "auth/popup-blocked") {
+      showAuthError("Il popup è stato bloccato dal browser. Consenti i popup per questo sito e riprova.");
+    } else if (err.code === "auth/unauthorized-domain") {
+      showAuthError("Dominio non autorizzato in Firebase Auth. Contatta il team Tech.");
+    } else {
+      showAuthError("Errore durante il login: " + (err.code || err.message));
+    }
+  }
+}
+
+async function doLogout() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  try { await fb.signOut(fb.auth); }
+  catch (err) { console.error("[auth] logout failed", err); }
+}
+
+function stopFirestoreListener() {
+  if (firestoreUnsub) { firestoreUnsub(); firestoreUnsub = null; }
+}
+
+function startFirestoreListener() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  setSyncBadge("syncing", "Sincronizzazione…");
+  const col = fb.collection(fb.db, FS_COLLECTION);
+  firestoreUnsub = fb.onSnapshot(
+    col,
+    { includeMetadataChanges: true },
+    async (snap) => {
+      // If Firestore is empty on the very first load, seed it (from localStorage
+      // if there's existing data, otherwise from the built-in seed).
+      if (!firstSnapshot && snap.empty && !migrationInFlight) {
+        migrationInFlight = true;
+        try {
+          await runFirstTimeSeed();
+        } finally {
+          migrationInFlight = false;
+        }
+        // The seed writes will trigger new snapshots; return so we don't paint
+        // an empty pipeline momentarily.
+        return;
+      }
+      firstSnapshot = true;
+
+      const incoming = [];
+      snap.forEach((d) => incoming.push(normalizeAssetDefaults(d.data())));
+      // Preserve seed ordering — otherwise rows would shuffle by document ID.
+      // Sort roughly by creation timestamp embedded in the id when possible.
+      incoming.sort((a, b) => extractIdWeight(a.id) - extractIdWeight(b.id));
+      assets = incoming;
+      if (!assets.some((a) => a.id === selectedId)) selectedId = assets[0]?.id || null;
+
+      const fromCache = snap.metadata.fromCache;
+      const pending = snap.metadata.hasPendingWrites;
+      if (pending) setSyncBadge("syncing", "Salvataggio…");
+      else if (fromCache) setSyncBadge("offline", navigator.onLine ? "Connessione al server…" : "Offline · dati locali");
+      else setSyncBadge("online", "Sincronizzato");
+
+      populateFilters();
+      render();
+    },
+    (err) => {
+      console.error("[firestore] listener error", err);
+      setSyncBadge("error", "Errore sync");
+      showToast("Errore di sincronizzazione: " + (err.code || err.message));
+    }
+  );
+}
+
+// Rank assets by numeric portion of the id, so `asset-1` < `asset-2` < ... but
+// also `asset-<timestamp>-<rand>` (used for user-created ones) still sorts
+// consistently. Older seed IDs stay at the top of the list.
+function extractIdWeight(id) {
+  if (!id) return Number.MAX_SAFE_INTEGER;
+  const m = /^asset-(\d+)/.exec(id);
+  if (!m) return Number.MAX_SAFE_INTEGER;
+  const n = Number(m[1]);
+  // Seed IDs are small integers (1..N). Runtime IDs are epoch ms (13+ digits).
+  return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
+}
+
+// First-time seeding: prefer existing localStorage data (migration), fall back
+// to the built-in seed. Any base64 data-URLs in the local data are uploaded to
+// Firebase Storage and replaced with proper URLs.
+async function runFirstTimeSeed() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  setSyncBadge("syncing", "Migrazione dati…");
+  const local = loadLocalAssets();
+  // Migrate any embedded base64 image to Storage
+  const migrated = [];
+  for (const a of local) {
+    let visual = a.visual || "";
+    let visualPath = a.visualPath || "";
+    if (visual && visual.startsWith("data:")) {
+      try {
+        const blob = await (await fetch(visual)).blob();
+        const guessedName = a.visualName || `visual.${blob.type.split("/")[1] || "jpg"}`;
+        const fakeFile = new File([blob], guessedName, { type: blob.type });
+        const uploaded = await uploadVisualToStorage(fakeFile, a.id);
+        visual = uploaded.url;
+        visualPath = uploaded.path;
+      } catch (err) {
+        console.warn("[migration] visual upload failed for", a.id, err);
+        visual = ""; visualPath = "";
+      }
+    }
+    migrated.push({ ...a, visual, visualPath });
+  }
+  await saveAssetsBulk(migrated);
+  // Remove local storage so the next login on this browser doesn't try to
+  // re-migrate the same content
+  try {
+    localStorage.removeItem(storageKey);
+    legacyStorageKeys.forEach((k) => localStorage.removeItem(k));
+  } catch (_) {}
+  showToast(`Dati iniziali caricati (${migrated.length} asset).`);
+}
+
+// ============================================================================
+// BOOT — wire login/logout and react to auth state changes
+// ============================================================================
+function bootFirebaseAuth() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  document.getElementById("btnLogin").addEventListener("click", doLogin);
+  document.getElementById("btnLogout").addEventListener("click", doLogout);
+
+  fb.onAuthStateChanged(fb.auth, async (user) => {
+    if (!user) {
+      // Signed out — tear down and show login
+      currentUser = null;
+      updateUserBadge(null);
+      stopFirestoreListener();
+      assets = []; selectedId = null; firstSnapshot = false;
+      render();
+      showAuthScreen();
+      return;
+    }
+    // Verify domain and email verified
+    const email = user.email || "";
+    if (!email.toLowerCase().endsWith("@" + ALLOWED_DOMAIN) || !user.emailVerified) {
+      console.warn("[auth] rejecting user", email, "verified=", user.emailVerified);
+      try { await fb.signOut(fb.auth); } catch (_) {}
+      showAuthScreen();
+      showAuthError(`Solo gli account @${ALLOWED_DOMAIN} verificati possono accedere. Hai effettuato il login con ${email || "(email non disponibile)"}.`);
+      return;
+    }
+    hideAuthError();
+    currentUser = user;
+    updateUserBadge(user);
+    hideAuthScreen();
+    // Rebuild UI now that the shell is visible
+    init();
+    startFirestoreListener();
+  });
+}
+
+// The rest of init() (bindings) runs the moment Auth resolves. But some element
+// lookups in the els cache below happen at file load time, before Auth. That's
+// fine — the elements exist in the DOM even while the shell is hidden.
+if (window.__firebase) {
+  bootFirebaseAuth();
+} else {
+  window.addEventListener("firebase-ready", bootFirebaseAuth, { once: true });
+  // Safety timeout in case the module import failed
+  setTimeout(() => {
+    if (!window.__firebase) {
+      setSyncBadge("error", "Firebase non caricato");
+      showAuthScreen();
+      showAuthError("Non è stato possibile caricare Firebase. Ricarica la pagina.");
+    }
+  }, 10000);
 }
 
 function bindNavigation() {
@@ -190,10 +501,29 @@ function bindActions() {
     control.addEventListener("input", render);
   });
 
-  document.getElementById("resetData").addEventListener("click", () => {
+  document.getElementById("resetData").addEventListener("click", async () => {
+    if (!confirm("Sei sicuro di voler ripristinare la pipeline con i dati iniziali? Verranno cancellati tutti i modifiche fatte dal team.")) return;
+    const fb = window.__firebase;
+    // Delete every asset currently in Firestore before writing the seed
+    if (fb) {
+      try {
+        let batch = fb.writeBatch(fb.db);
+        let n = 0;
+        for (const a of assets) {
+          batch.delete(fb.doc(fb.db, FS_COLLECTION, a.id));
+          n++;
+          if (n % 400 === 0) { await batch.commit(); batch = fb.writeBatch(fb.db); }
+        }
+        if (n % 400 !== 0) await batch.commit();
+      } catch (err) {
+        console.error("[reset] delete failed", err);
+        showToast("Errore reset: " + (err.code || err.message));
+        return;
+      }
+    }
     assets = structuredClone(seedAssets);
     selectedId = assets[0].id;
-    saveAssets();
+    await saveAssetsBulk(assets);
     populateFilters();
     render();
     showToast("Pipeline ripristinata.");
@@ -429,7 +759,7 @@ function copyTemplate(asset) {
 function bindDetailControls(asset) {
   const update = (patch) => {
     Object.assign(asset, patch);
-    saveAssets();
+    saveAssets(asset);
     renderKpis();
     renderRows();
   };
@@ -445,7 +775,9 @@ function bindDetailControls(asset) {
   document.getElementById("editAsset")?.addEventListener("click", () => openEditAssetDrawer(asset));
   document.getElementById("duplicateAsset")?.addEventListener("click", () => duplicateAsset(asset));
   document.getElementById("removeVisual")?.addEventListener("click", () => {
-    update({ visual: "", visualName: "" });
+    const oldPath = asset.visualPath;
+    update({ visual: "", visualName: "", visualPath: "" });
+    if (oldPath) deleteVisualFromStorage(oldPath);
     renderDetail();
     showToast("Visual rimosso.");
   });
@@ -511,40 +843,46 @@ function closeAssetDrawer() {
   editingAssetId = null;
 }
 
-function handleAssetSubmit(event) {
+async function handleAssetSubmit(event) {
   event.preventDefault();
   const formData = new FormData(els.assetForm);
   const existingAsset = assets.find((asset) => asset.id === editingAssetId) || null;
   const asset = buildAssetFromForm(formData, existingAsset);
   const file = formData.get("visualFile");
 
-  const finish = () => {
-    if (existingAsset) {
-      Object.assign(existingAsset, asset);
-    } else {
-      assets.unshift(asset);
-    }
-    selectedId = asset.id;
-    saveAssets();
-    populateFilters();
-    closeAssetDrawer();
-    currentView = "production";
-    showProductionView();
-    render();
-    showToast(existingAsset ? "Asset aggiornato." : "Asset creato in pipeline.");
-  };
-
+  // Optional visual: upload to Firebase Storage first, then persist the asset
   if (file && file.size) {
-    const reader = new FileReader();
-    reader.onload = () => {
-      asset.visual = reader.result;
+    try {
+      setSyncBadge("syncing", "Caricamento visual…");
+      const { url, path } = await uploadVisualToStorage(file, asset.id);
+      // If we're replacing a visual, remove the old file from Storage
+      if (existingAsset?.visualPath && existingAsset.visualPath !== path) {
+        deleteVisualFromStorage(existingAsset.visualPath); // fire-and-forget
+      }
+      asset.visual = url;
       asset.visualName = file.name;
-      finish();
-    };
-    reader.readAsDataURL(file);
-  } else {
-    finish();
+      asset.visualPath = path;
+    } catch (err) {
+      console.error("[storage] upload failed", err);
+      setSyncBadge("error", "Errore upload visual");
+      showToast("Errore upload visual: " + (err.code || err.message));
+      return;
+    }
   }
+
+  if (existingAsset) {
+    Object.assign(existingAsset, asset);
+  } else {
+    assets.unshift(asset);
+  }
+  selectedId = asset.id;
+  await saveAssetToFirestore(existingAsset || asset);
+  populateFilters();
+  closeAssetDrawer();
+  currentView = "production";
+  showProductionView();
+  render();
+  showToast(existingAsset ? "Asset aggiornato." : "Asset creato in pipeline.");
 }
 
 function buildAssetFromForm(formData, existingAsset = null) {
@@ -574,7 +912,8 @@ function buildAssetFromForm(formData, existingAsset = null) {
     notes: existingAsset?.notes || "",
     performance: existingAsset?.performance || null,
     visual: existingAsset?.visual || "",
-    visualName: existingAsset?.visualName || ""
+    visualName: existingAsset?.visualName || "",
+    visualPath: existingAsset?.visualPath || ""
   };
 }
 
@@ -681,18 +1020,55 @@ function shortSlug(value, maxLength) {
     .replace(/_+$/g, "") || "asset";
 }
 
-function handleVisualUpload(event, asset) {
+async function handleVisualUpload(event, asset) {
   const file = event.target.files?.[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    asset.visual = reader.result;
+  try {
+    setSyncBadge("syncing", "Caricamento visual…");
+    const { url, path } = await uploadVisualToStorage(file, asset.id);
+    const oldPath = asset.visualPath;
+    asset.visual = url;
     asset.visualName = file.name;
-    saveAssets();
+    asset.visualPath = path;
+    if (oldPath && oldPath !== path) deleteVisualFromStorage(oldPath);
+    await saveAssetToFirestore(asset);
     render();
     showToast("Visual collegato alla riga.");
-  };
-  reader.readAsDataURL(file);
+  } catch (err) {
+    console.error("[storage] upload failed", err);
+    setSyncBadge("error", "Errore upload visual");
+    showToast("Errore upload visual: " + (err.code || err.message));
+  }
+}
+
+// ------- Firebase Storage helpers -------
+function pickExtension(file) {
+  const match = /\.([a-z0-9]+)$/i.exec(file.name || "");
+  if (match) return match[1].toLowerCase();
+  const mimeMap = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif" };
+  return mimeMap[file.type] || "bin";
+}
+
+async function uploadVisualToStorage(file, assetId) {
+  const fb = window.__firebase;
+  if (!fb) throw new Error("Firebase non pronto");
+  const ext = pickExtension(file);
+  const path = `${STORAGE_PREFIX}/${assetId}-${Date.now()}.${ext}`;
+  const ref = fb.storageRef(fb.storage, path);
+  const snap = await fb.uploadBytes(ref, file, { contentType: file.type || "application/octet-stream" });
+  const url = await fb.getDownloadURL(snap.ref);
+  return { url, path };
+}
+
+async function deleteVisualFromStorage(path) {
+  const fb = window.__firebase;
+  if (!fb || !path) return;
+  try {
+    await fb.deleteObject(fb.storageRef(fb.storage, path));
+  } catch (err) {
+    // Silent — file may already be gone
+    console.warn("[storage] delete failed", path, err.code || err.message);
+  }
 }
 
 function renderAnalytics() {
@@ -802,10 +1178,10 @@ function handlePipelineCsvImport(event) {
   if (!file) return;
 
   const reader = new FileReader();
-  reader.onload = () => {
+  reader.onload = async () => {
     const rows = parseCsv(String(reader.result || ""));
     const result = applyPipelineRows(rows);
-    saveAssets();
+    await saveAssetsBulk(assets);
     populateFilters();
     render();
     showToast(`${result.created} creati · ${result.updated} aggiornati dal tab ADV Pipeline.`);
@@ -924,10 +1300,10 @@ function handleMetaCsvImport(event) {
   if (!file) return;
 
   const reader = new FileReader();
-  reader.onload = () => {
+  reader.onload = async () => {
     const rows = parseCsv(String(reader.result || ""));
     const result = applyMetaRows(rows, file.name);
-    saveAssets();
+    await saveAssetsBulk(assets);
     render();
     showToast(`${result.matched} asset matchati da ${file.name}.`);
     els.metaCsvInput.value = "";
@@ -1166,4 +1542,4 @@ function showToast(message) {
   toastTimer = setTimeout(() => els.toast.classList.remove("is-visible"), 2200);
 }
 
-init();
+// init() is now called from bootFirebaseAuth() after a valid @dalfilo.com login.
