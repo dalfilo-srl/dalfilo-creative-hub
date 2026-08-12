@@ -57,39 +57,39 @@ const fallbackSeedAssets = [
   visualName: ""
 }));
 
-const benchmarks = {
-  Static: "Volume driver. Best on rm_ + HP. Always run 2+ variants.",
-  Video: "Evaluate by retention, watch time and conversion role. UGC first.",
-  GIF: "Lowest CPM. Mandatory rt_ asset for every active collection.",
-  Carousel: "Discovery layer. Best on warm audience or HP, avoid cold PLP."
-};
-
 const seedAssets = Array.isArray(window.DALFILO_SEED_ASSETS)
   ? window.DALFILO_SEED_ASSETS.map(normalizeAssetDefaults)
   : fallbackSeedAssets.map(normalizeAssetDefaults);
 
 const storageKey = "dalfilo-creative-hub-v3";
 const legacyStorageKeys = ["dalfilo-creative-hub-v2", "dalfilo-creative-hub-v1"];
+const notesStorageKey = "dalfilo-creative-hub-notes";
 let assets = loadAssets();
 let selectedId = assets[0]?.id || null;
+let modalAssetId = null;
 let currentView = "production";
 let editingAssetId = null;
+let lastPipelineImportAt = loadLastImportTimestamp();
 
 const els = {
   rows: document.getElementById("assetRows"),
   detail: document.getElementById("assetDetail"),
-  emptyDetail: document.getElementById("emptyDetail"),
   resultCount: document.getElementById("resultCount"),
   toast: document.getElementById("toast"),
   search: document.getElementById("searchInput"),
-  statusFilter: document.getElementById("statusFilter"),
   formatFilter: document.getElementById("formatFilter"),
-  priorityFilter: document.getElementById("priorityFilter"),
   missingVisualOnly: document.getElementById("missingVisualOnly"),
   pipelineCsvInput: document.getElementById("pipelineCsvInput"),
   metaCsvInput: document.getElementById("metaCsvInput"),
   assetDrawer: document.getElementById("assetDrawer"),
-  assetForm: document.getElementById("assetForm")
+  assetForm: document.getElementById("assetForm"),
+  modalBackdrop: document.getElementById("assetModalBackdrop"),
+  modalPrev: document.getElementById("modalPrev"),
+  modalNext: document.getElementById("modalNext"),
+  modalPill: document.getElementById("modalPill"),
+  modalTitle: document.getElementById("modalTitle"),
+  modalClose: document.getElementById("modalClose"),
+  teamNotes: document.getElementById("teamNotes")
 };
 
 let namingTouched = false;
@@ -143,7 +143,8 @@ function normalizeAssetDefaults(asset) {
     notes: asset.notes || "",
     performance: asset.performance || null,
     visual: asset.visual || "",
-    visualName: asset.visualName || ""
+    visualName: asset.visualName || "",
+    isNew: asset.isNew || false
   };
 }
 
@@ -163,13 +164,35 @@ function mergePreservedAssetState(targetAssets, previousAssets) {
 }
 
 function saveAssets() {
-  localStorage.setItem(storageKey, JSON.stringify({ assets, savedAt: new Date().toISOString() }));
+  localStorage.setItem(storageKey, JSON.stringify({ assets, savedAt: new Date().toISOString(), lastPipelineImportAt }));
+}
+
+function loadLastImportTimestamp() {
+  const saved = localStorage.getItem(storageKey);
+  if (!saved) return null;
+  try {
+    const parsed = JSON.parse(saved);
+    return parsed.lastPipelineImportAt || null;
+  } catch {
+    return null;
+  }
+}
+
+function loadTeamNotes() {
+  return localStorage.getItem(notesStorageKey) || "";
+}
+
+function saveTeamNotes(value) {
+  localStorage.setItem(notesStorageKey, value);
 }
 
 function init() {
   bindNavigation();
   bindActions();
+  bindModal();
   populateFilters();
+  els.teamNotes.value = loadTeamNotes();
+  els.teamNotes.addEventListener("input", (event) => saveTeamNotes(event.target.value));
   render();
 }
 
@@ -180,21 +203,26 @@ function bindNavigation() {
       document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("is-active", item === button));
       document.querySelectorAll(".view").forEach((view) => view.classList.remove("is-active"));
       document.getElementById(`${currentView}View`).classList.add("is-active");
+      closeAssetModal();
       render();
     });
   });
 }
 
 function bindActions() {
-  [els.search, els.statusFilter, els.formatFilter, els.priorityFilter, els.missingVisualOnly].forEach((control) => {
+  [els.search, els.formatFilter, els.missingVisualOnly].forEach((control) => {
     control.addEventListener("input", render);
   });
 
   document.getElementById("resetData").addEventListener("click", () => {
+    const confirmed = window.confirm("Ripristinare i dati iniziali? Visual, note e modifiche locali andranno persi. L'operazione non si puo annullare.");
+    if (!confirmed) return;
     assets = structuredClone(seedAssets);
     selectedId = assets[0].id;
+    lastPipelineImportAt = null;
     saveAssets();
     populateFilters();
+    closeAssetModal();
     render();
     showToast("Pipeline ripristinata.");
   });
@@ -219,9 +247,7 @@ function bindActions() {
 }
 
 function populateFilters() {
-  fillSelect(els.statusFilter, ["Tutti gli status", ...unique("status")]);
   fillSelect(els.formatFilter, ["Tutti i format", ...unique("format")]);
-  fillSelect(els.priorityFilter, ["Tutte le priorita", ...unique("priority")]);
 }
 
 function fillSelect(select, values) {
@@ -247,14 +273,13 @@ function getFilteredAssets() {
       asset.productCluster,
       asset.cta,
       asset.prospectingMessage,
-      asset.remarketingMessage
+      asset.remarketingMessage,
+      asset.notes
     ].join(" ").toLowerCase();
     const matchesQuery = !query || text.includes(query);
-    const matchesStatus = !els.statusFilter.value || asset.status === els.statusFilter.value;
     const matchesFormat = !els.formatFilter.value || asset.format === els.formatFilter.value;
-    const matchesPriority = !els.priorityFilter.value || asset.priority === els.priorityFilter.value;
     const matchesVisual = !els.missingVisualOnly.checked || !asset.visual;
-    return matchesQuery && matchesStatus && matchesFormat && matchesPriority && matchesVisual;
+    return matchesQuery && matchesFormat && matchesVisual;
   }).sort((a, b) => sortableDate(a.goLive) - sortableDate(b.goLive));
 }
 
@@ -272,29 +297,34 @@ function render() {
   renderKpis();
   if (currentView === "production") {
     renderRows();
-    renderDetail();
   }
   if (currentView === "analytics") renderAnalytics();
   if (currentView === "visuals") renderVisualLibrary();
+  if (modalAssetId) renderModalContent();
 }
 
 function renderKpis() {
-  const open = assets.filter((asset) => asset.status !== "Done");
   setText("kpiTotal", assets.length);
-  setText("kpiDraft", assets.filter((asset) => asset.status === "Draft").length);
-  setText("kpiWip", assets.filter((asset) => asset.status === "Work in progress").length);
-  setText("kpiVisuals", assets.filter((asset) => asset.visual).length);
-  setText("kpiHigh", open.filter((asset) => asset.priority === "High").length);
+  setText("kpiMissingVisual", assets.filter((asset) => !asset.visual && asset.status !== "Done").length);
   setText("kpiPerf", assets.filter((asset) => asset.performance).length);
+  renderLastImportLine();
+}
+
+function renderLastImportLine() {
+  const el = document.getElementById("lastImportLine");
+  if (!el) return;
+  const dateLabel = lastPipelineImportAt
+    ? new Date(lastPipelineImportAt).toLocaleDateString("it-IT", { day: "numeric", month: "long", year: "numeric" })
+    : "mai importato";
+  el.innerHTML = `Ultimo import ADV Pipeline: <strong>${escapeHtml(dateLabel)}</strong> · "Import Meta CSV" si trova ora nella scheda Analisi.`;
 }
 
 function renderRows() {
   const filtered = getFilteredAssets();
   els.resultCount.textContent = `${filtered.length} righe`;
-  if (!filtered.some((asset) => asset.id === selectedId)) selectedId = filtered[0]?.id || null;
 
   els.rows.innerHTML = filtered.map((asset) => `
-    <tr class="${asset.id === selectedId ? "is-selected" : ""}" data-id="${asset.id}">
+    <tr data-id="${asset.id}">
       <td>
         <div class="asset-name campaign-cell">
           <strong>${escapeHtml(asset.campaign || "-")}</strong>
@@ -304,6 +334,7 @@ function renderRows() {
       <td>
         <div class="asset-name">
           <strong>${escapeHtml(asset.assetName)}</strong>
+          ${asset.isNew ? `<small><span class="pill high">Nuovo</span></small>` : ""}
         </div>
       </td>
       <td>${escapeHtml(asset.goLive || "-")}</td>
@@ -319,70 +350,108 @@ function renderRows() {
   `).join("");
 
   els.rows.querySelectorAll("tr").forEach((row) => {
-    row.addEventListener("click", () => {
-      selectedId = row.dataset.id;
-      renderRows();
-      renderDetail();
-    });
+    row.addEventListener("click", () => openAssetModal(row.dataset.id));
   });
 }
 
-function renderDetail() {
-  const asset = assets.find((item) => item.id === selectedId);
-  els.emptyDetail.hidden = Boolean(asset);
-  els.detail.hidden = !asset;
-  if (!asset) return;
+function bindModal() {
+  els.modalClose.addEventListener("click", closeAssetModal);
+  els.modalBackdrop.addEventListener("click", (event) => {
+    if (event.target === els.modalBackdrop) closeAssetModal();
+  });
+  els.modalPrev.addEventListener("click", () => navigateModal(-1));
+  els.modalNext.addEventListener("click", () => navigateModal(1));
+}
 
+function openAssetModal(id) {
+  const asset = assets.find((item) => item.id === id);
+  if (!asset) return;
+  modalAssetId = id;
+  if (asset.isNew) {
+    asset.isNew = false;
+    saveAssets();
+    renderRows();
+  }
+  els.modalBackdrop.hidden = false;
+  renderModalContent();
+}
+
+function closeAssetModal() {
+  modalAssetId = null;
+  els.modalBackdrop.hidden = true;
+  els.detail.innerHTML = "";
+}
+
+function navigateModal(direction) {
+  if (!modalAssetId) return;
+  const list = getFilteredAssets();
+  const index = list.findIndex((asset) => asset.id === modalAssetId);
+  if (index === -1) return;
+  const nextIndex = index + direction;
+  if (nextIndex < 0 || nextIndex >= list.length) return;
+  openAssetModal(list[nextIndex].id);
+}
+
+function renderModalContent() {
+  const asset = assets.find((item) => item.id === modalAssetId);
+  if (!asset) {
+    closeAssetModal();
+    return;
+  }
+
+  const list = getFilteredAssets();
+  const index = list.findIndex((item) => item.id === asset.id);
+  els.modalPrev.disabled = index <= 0;
+  els.modalNext.disabled = index === -1 || index >= list.length - 1;
+
+  els.modalPill.textContent = asset.format;
+  els.modalPill.className = `pill ${asset.format.toLowerCase()}`;
+  els.modalTitle.textContent = asset.assetName;
+
+  renderDetail(asset);
+}
+
+function renderDetail(asset) {
   els.detail.innerHTML = `
     <div class="detail-hero">
       ${asset.visual ? `<img src="${asset.visual}" alt="${escapeHtml(asset.assetName)}">` : uploadTemplate(asset.id)}
     </div>
-    <div class="detail-body">
-      <div class="detail-title">
-        <span class="pill ${asset.format.toLowerCase()}">${escapeHtml(asset.format)} · ${escapeHtml(asset.creativeType)}</span>
-        <h3>${escapeHtml(asset.assetName)}</h3>
-      </div>
-      <div class="meta-grid">
-        ${metaItem("Campagna", asset.campaign)}
-        ${metaItem("Go live", asset.goLive)}
-        ${metaItem("Deadline", asset.deadline)}
-        ${metaItem("Country", asset.country)}
-        ${metaItem("Campaign type", asset.campaignType)}
-        ${metaItem("Product category", asset.productCategory)}
-        ${metaItem("Product cluster", asset.productCluster)}
-        ${metaItem("Funnel", asset.funnel)}
-        ${metaItem("Landing", asset.landing)}
-        ${metaItem("Naming", asset.naming)}
-        ${metaItem("Owner", asset.assignee)}
-        ${metaItem("Priorita", asset.priority)}
-      </div>
-      <p class="notes"><strong>Hook:</strong> ${escapeHtml(asset.hook || "-")}</p>
-      ${copyTemplate(asset)}
-      <p class="notes"><strong>Rationale:</strong> ${escapeHtml(asset.rationale || "-")}</p>
-      ${performanceTemplate(asset)}
-      <div class="detail-controls">
-        <label class="field">
-          <span>Status</span>
-          <select id="detailStatus">
-            ${["Draft", "Work in progress", "Review", "Ready", "Done"].map((status) => `<option ${asset.status === status ? "selected" : ""}>${status}</option>`).join("")}
-          </select>
-        </label>
-        <label class="field">
-          <span>Owner</span>
-          <input id="detailOwner" type="text" value="${escapeAttr(asset.assignee || "")}">
-        </label>
-        <label class="field full">
-          <span>Note visual / learning</span>
-          <textarea id="detailNotes" placeholder="Es. visual dominante, crop, insight post-performance...">${escapeHtml(asset.notes || "")}</textarea>
-        </label>
-      </div>
-      <div class="actions">
-        <button class="primary-button" type="button" id="editAsset">Modifica asset</button>
-        <button class="ghost-button" type="button" id="duplicateAsset">Duplica asset</button>
-        ${asset.visual ? `<button class="ghost-button" type="button" id="replaceVisual">Sostituisci visual</button><button class="ghost-button" type="button" id="removeVisual">Rimuovi visual</button>` : ""}
-        <button class="ghost-button danger" type="button" id="deleteAsset">Elimina asset</button>
-        <input id="hiddenVisualInput" type="file" accept="image/*" hidden>
-      </div>
+    <div class="meta-grid">
+      ${metaItem("Campagna", asset.campaign, true)}
+      ${metaItem("Deadline", asset.deadline)}
+      ${metaItem("Go live", asset.goLive)}
+      ${metaItem("Campaign type", asset.campaignType)}
+      ${metaItem("Country", asset.country)}
+      ${metaItem("Product cluster", asset.productCluster)}
+      ${metaItem("Product category", asset.productCategory)}
+      ${metaItem("Funnel", asset.funnel)}
+      ${metaItem("Landing", asset.landing)}
+      ${metaItem("Naming", asset.naming, true)}
+    </div>
+    ${copyTemplate(asset)}
+    ${performanceTemplate(asset)}
+    <div class="detail-controls">
+      <label class="field">
+        <span>Status</span>
+        <select id="detailStatus">
+          ${["Draft", "Work in progress", "Review", "Ready", "Done"].map((status) => `<option ${asset.status === status ? "selected" : ""}>${status}</option>`).join("")}
+        </select>
+      </label>
+      <label class="field">
+        <span>Owner</span>
+        <input id="detailOwner" type="text" value="${escapeAttr(asset.assignee || "")}">
+      </label>
+      <label class="field full">
+        <span>Note visual / learning</span>
+        <textarea id="detailNotes" placeholder="Es. visual dominante, crop, insight post-performance...">${escapeHtml(asset.notes || "")}</textarea>
+      </label>
+    </div>
+    <div class="actions">
+      <button class="primary-button" type="button" id="editAsset">Modifica asset</button>
+      <button class="ghost-button" type="button" id="duplicateAsset">Duplica asset</button>
+      ${asset.visual ? `<button class="ghost-button" type="button" id="replaceVisual">Sostituisci visual</button><button class="ghost-button" type="button" id="removeVisual">Rimuovi visual</button>` : ""}
+      <button class="ghost-button danger" type="button" id="deleteAsset">Elimina asset</button>
+      <input id="hiddenVisualInput" type="file" accept="image/*" hidden>
     </div>
   `;
 
@@ -401,8 +470,8 @@ function uploadTemplate(id) {
   `;
 }
 
-function metaItem(label, value) {
-  return `<div class="meta-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value || "-")}</strong></div>`;
+function metaItem(label, value, full = false) {
+  return `<div class="meta-item${full ? " full" : ""}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value || "-")}</strong></div>`;
 }
 
 function performanceTemplate(asset) {
@@ -418,7 +487,6 @@ function performanceTemplate(asset) {
       ${performanceMetric("CTR", formatMetric(perf.ctr, "percent"))}
       ${performanceMetric("CPR", formatMetric(perf.cpr, "currency"))}
     </div>
-    <p class="notes"><strong>Insight:</strong> ${escapeHtml(perf.insight)}</p>
   `;
 }
 
@@ -427,9 +495,10 @@ function performanceMetric(label, value) {
 }
 
 function copyTemplate(asset) {
-  if (!asset.cta && !asset.prospectingMessage && !asset.remarketingMessage) return "";
+  if (!asset.hook && !asset.cta && !asset.prospectingMessage && !asset.remarketingMessage) return "";
   return `
     <div class="copy-block">
+      ${asset.hook ? `<p><strong>Hook:</strong> ${escapeHtml(asset.hook)}</p>` : ""}
       ${asset.cta ? `<p><strong>CTA:</strong> ${escapeHtml(asset.cta)}</p>` : ""}
       ${asset.prospectingMessage ? `<p><strong>Prospecting:</strong> ${escapeHtml(asset.prospectingMessage)}</p>` : ""}
       ${asset.remarketingMessage ? `<p><strong>Remarketing:</strong> ${escapeHtml(asset.remarketingMessage)}</p>` : ""}
@@ -453,11 +522,17 @@ function bindDetailControls(asset) {
   input.addEventListener("change", (event) => handleVisualUpload(event, asset));
 
   document.getElementById("replaceVisual")?.addEventListener("click", () => document.getElementById("hiddenVisualInput").click());
-  document.getElementById("editAsset")?.addEventListener("click", () => openEditAssetDrawer(asset));
-  document.getElementById("duplicateAsset")?.addEventListener("click", () => duplicateAsset(asset));
+  document.getElementById("editAsset")?.addEventListener("click", () => {
+    closeAssetModal();
+    openEditAssetDrawer(asset);
+  });
+  document.getElementById("duplicateAsset")?.addEventListener("click", () => {
+    closeAssetModal();
+    duplicateAsset(asset);
+  });
   document.getElementById("removeVisual")?.addEventListener("click", () => {
     update({ visual: "", visualName: "" });
-    renderDetail();
+    renderDetail(asset);
     showToast("Visual rimosso.");
   });
   document.getElementById("deleteAsset")?.addEventListener("click", () => deleteAsset(asset));
@@ -474,6 +549,9 @@ function deleteAsset(asset) {
 
   if (selectedId === asset.id) {
     selectedId = assets[0]?.id || null;
+  }
+  if (modalAssetId === asset.id) {
+    closeAssetModal();
   }
 
   saveAssets();
@@ -566,13 +644,11 @@ function handleAssetSubmit(event) {
   };
 
   if (file && file.size) {
-    const reader = new FileReader();
-    reader.onload = () => {
-      asset.visual = reader.result;
+    compressImage(file).then((dataUrl) => {
+      asset.visual = dataUrl || "";
       asset.visualName = file.name;
       finish();
-    };
-    reader.readAsDataURL(file);
+    });
   } else {
     finish();
   }
@@ -715,22 +791,73 @@ function shortSlug(value, maxLength) {
 function handleVisualUpload(event, asset) {
   const file = event.target.files?.[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    asset.visual = reader.result;
+  compressImage(file).then((dataUrl) => {
+    asset.visual = dataUrl || "";
     asset.visualName = file.name;
     saveAssets();
     render();
     showToast("Visual collegato alla riga.");
-  };
-  reader.readAsDataURL(file);
+  });
+}
+
+function compressImage(file, maxDimension = 1600, quality = 0.82) {
+  return new Promise((resolve) => {
+    if (!file.type || file.type === "image/gif") {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDimension || height > maxDimension) {
+          if (width >= height) {
+            height = Math.round((height / width) * maxDimension);
+            width = maxDimension;
+          } else {
+            width = Math.round((width / height) * maxDimension);
+            height = maxDimension;
+          }
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => resolve(reader.result);
+      img.src = String(reader.result || "");
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
 }
 
 function renderAnalytics() {
+  renderAnalyticsStatusLine();
   renderScorecard();
   renderMixChart();
-  renderPriorities();
   renderPerformanceInsights();
+}
+
+function renderAnalyticsStatusLine() {
+  const el = document.getElementById("analyticsStatusLine");
+  if (!el) return;
+  const importDates = assets
+    .filter((asset) => asset.performance && asset.performance.importedAt)
+    .map((asset) => asset.performance.importedAt)
+    .sort();
+  const latest = importDates.length ? importDates[importDates.length - 1] : null;
+  const metaLabel = latest
+    ? new Date(latest).toLocaleDateString("it-IT", { day: "numeric", month: "long", year: "numeric" })
+    : "mai importato";
+  el.innerHTML = `Basata su <strong>${assets.length} asset</strong> attualmente in pipeline · ultimo import Meta: <strong>${escapeHtml(metaLabel)}</strong>`;
 }
 
 function renderScorecard() {
@@ -743,36 +870,47 @@ function renderScorecard() {
       <div class="scorecard-card">
         <span class="pill ${format.toLowerCase()}">${format}</span>
         <strong>${items.length} asset · ${missingVisuals} senza visual</strong>
-        <p>${benchmarks[format]}</p>
       </div>
     `;
   }).join("");
 }
 
 function renderMixChart() {
-  const container = document.getElementById("mixChart");
+  const svg = document.getElementById("mixDonut");
+  const legend = document.getElementById("mixLegend");
   const open = assets.filter((asset) => asset.status !== "Done");
+  const colors = { Static: "#a8522e", GIF: "#af8427", Video: "#47745a", Carousel: "#315f85" };
   const counts = countBy(open, "format");
-  const max = Math.max(...Object.values(counts), 1);
-  container.innerHTML = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([label, count]) => `
-    <div class="bar-row">
-      <header><span>${escapeHtml(label)}</span><span>${count}</span></header>
-      <div class="bar-track"><div class="bar-fill" style="width:${(count / max) * 100}%"></div></div>
+  const data = Object.entries(counts)
+    .filter(([, value]) => value > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([label, value]) => ({ label, value, color: colors[label] || "#766a60" }));
+
+  if (!data.length) {
+    svg.innerHTML = "";
+    legend.innerHTML = `<p class="notes">Nessun asset attivo da rappresentare.</p>`;
+    return;
+  }
+
+  const total = data.reduce((sum, item) => sum + item.value, 0);
+  const r = 15.9;
+  const cx = 21;
+  const cy = 21;
+  let offset = 0;
+  let circles = "";
+  data.forEach((item) => {
+    const pct = (item.value / total) * 100;
+    circles += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="transparent" stroke="${item.color}" stroke-width="6" stroke-dasharray="${pct} ${100 - pct}" stroke-dashoffset="${100 - offset + 25}"><title>${escapeHtml(item.label)}: ${item.value} (${pct.toFixed(0)}%)</title></circle>`;
+    offset += pct;
+  });
+  svg.innerHTML = `${circles}<text x="21" y="23" text-anchor="middle" font-size="6" fill="#29231e" font-weight="700">${total}</text>`;
+
+  legend.innerHTML = data.map((item) => `
+    <div class="legend-row">
+      <span class="legend-dot" style="background:${item.color}"></span>
+      ${escapeHtml(item.label)}
+      <strong>${item.value} · ${((item.value / total) * 100).toFixed(0)}%</strong>
     </div>
-  `).join("");
-}
-
-function renderPriorities() {
-  const container = document.getElementById("priorityList");
-  const items = assets
-    .filter((asset) => asset.priority === "High" && asset.status !== "Done")
-    .slice(0, 6);
-
-  container.innerHTML = items.map((asset) => `
-    <article class="priority-card">
-      <strong>${escapeHtml(asset.assetName)}</strong>
-      <p>${escapeHtml(asset.deadline || "-")} · ${escapeHtml(asset.format)} · ${escapeHtml(asset.funnel)}</p>
-    </article>
   `).join("");
 }
 
@@ -815,13 +953,21 @@ function renderPerformanceInsights() {
 
 function renderVisualLibrary() {
   const withVisual = assets.filter((asset) => asset.visual);
-  document.getElementById("libraryCount").textContent = `${withVisual.length} visual`;
+  document.getElementById("libraryCount").innerHTML = `<strong>${withVisual.length}</strong> visual caricati su ${assets.length} asset`;
+
+  const formats = ["Video", "Static", "GIF", "Carousel"];
+  document.getElementById("formatStats").innerHTML = formats.map((format) => {
+    const count = assets.filter((asset) => asset.format === format).length;
+    return `<div><strong>${count}</strong><small>${escapeHtml(format)}</small></div>`;
+  }).join("");
+
   document.getElementById("visualLibrary").innerHTML = withVisual.length ? withVisual.map((asset) => `
     <article class="visual-card">
       <img src="${asset.visual}" alt="${escapeHtml(asset.assetName)}">
       <div>
         <strong>${escapeHtml(asset.assetName)}</strong>
         <small>${escapeHtml(asset.format)} · ${escapeHtml(asset.campaign)}</small>
+        ${asset.performance ? `<small><span class="perf-badge has-data">${escapeHtml(asset.performance.badge)}</span></small>` : ""}
         <small>${escapeHtml(asset.notes || "Nessun learning ancora")}</small>
       </div>
     </article>
@@ -836,6 +982,7 @@ function handlePipelineCsvImport(event) {
   reader.onload = () => {
     const rows = parseCsv(String(reader.result || ""));
     const result = applyPipelineRows(rows);
+    lastPipelineImportAt = new Date().toISOString();
     saveAssets();
     populateFilters();
     render();
@@ -858,10 +1005,12 @@ function applyPipelineRows(rows) {
         notes: existing.notes || incoming.notes || "",
         performance: existing.performance || null,
         visual: existing.visual || "",
-        visualName: existing.visualName || ""
+        visualName: existing.visualName || "",
+        isNew: existing.isNew || false
       });
       updated += 1;
     } else {
+      incoming.isNew = true;
       assets.unshift(incoming);
       created += 1;
     }
@@ -904,7 +1053,8 @@ function normalizePipelineRow(row) {
     notes: "",
     performance: null,
     visual: "",
-    visualName: ""
+    visualName: "",
+    isNew: false
   };
 }
 

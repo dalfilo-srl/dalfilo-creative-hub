@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Dalfilo Creative Hub</title>
-    <link rel="stylesheet" href="./styles.css?v=20260810a" />
+    <link rel="stylesheet" href="./styles.css?v=20260814a" />
   </head>
   <body>
     <div class="app-shell">
@@ -28,167 +28,170 @@
           <a href="https://docs.google.com/spreadsheets/d/1aK_UxQtLOcO8nWyi2T2_8fsp0qW7QLRfvTDk1psBWtc/edit?gid=1082250784#gid=1082250784" target="_blank" rel="noreferrer">Google Sheet · tab ADV Pipeline</a>
           <small>Per le ADV importa il CSV esportato dal tab ADV Pipeline. Gli altri tab dello spreadsheet non vanno usati per creare la pipeline.</small>
         </section>
+
+        <div class="rail-footer">
+          <button class="danger-link" type="button" id="resetData" title="Ripristina i dati iniziali">Ripristina dati iniziali</button>
+          <small>Cancella visual, note e modifiche locali. Usa solo per ripartire da zero.</small>
+        </div>
       </aside>
 
       <main class="workspace">
-        <header class="topbar">
-          <div>
-            <p class="eyebrow">Produzione + performance intelligence</p>
-            <h2>Hub operativo ADV Creative</h2>
-          </div>
-          <div class="actions">
-            <button class="primary-button" type="button" id="newAssetButton" title="Crea un nuovo asset in produzione">+ Nuovo asset</button>
-            <button class="ghost-button" type="button" id="importPipelineCsv" title="Importa il CSV esportato dal tab ADV Pipeline">Import ADV Pipeline CSV</button>
-            <button class="ghost-button" type="button" id="importMetaCsv" title="Importa export CSV da Meta Ads">Import Meta CSV</button>
-            <button class="ghost-button" type="button" id="resetData" title="Ripristina i dati iniziali">Reset</button>
-            <button class="ghost-button" type="button" id="exportCsv" title="Esporta pipeline in CSV">CSV</button>
-            <button class="primary-button" type="button" id="exportJson" title="Esporta stato completo con visual">JSON</button>
-            <input id="pipelineCsvInput" type="file" accept=".csv,text/csv" hidden />
-            <input id="metaCsvInput" type="file" accept=".csv,text/csv" hidden />
-          </div>
-        </header>
 
-        <section class="kpis" aria-label="KPI pipeline">
-          <article class="kpi">
-            <span id="kpiTotal">0</span>
-            <p>Asset totali</p>
-          </article>
-          <article class="kpi">
-            <span id="kpiDraft">0</span>
-            <p>Draft</p>
-          </article>
-          <article class="kpi">
-            <span id="kpiWip">0</span>
-            <p>Work in progress</p>
-          </article>
-          <article class="kpi">
-            <span id="kpiVisuals">0</span>
-            <p>Visual caricati</p>
-          </article>
-          <article class="kpi accent">
-            <span id="kpiHigh">0</span>
-            <p>High priority aperti</p>
-          </article>
-          <article class="kpi">
-            <span id="kpiPerf">0</span>
-            <p>Performance match</p>
-          </article>
-        </section>
-
-        <section class="toolbar" aria-label="Filtri">
-          <label class="field search-field">
-            <span>Cerca</span>
-            <input id="searchInput" type="search" placeholder="Asset focus, campagna, naming, hook..." />
-          </label>
-          <label class="field">
-            <span>Status</span>
-            <select id="statusFilter"></select>
-          </label>
-          <label class="field">
-            <span>Formato</span>
-            <select id="formatFilter"></select>
-          </label>
-          <label class="field">
-            <span>Priorità</span>
-            <select id="priorityFilter"></select>
-          </label>
-          <label class="toggle">
-            <input id="missingVisualOnly" type="checkbox" />
-            <span>Solo senza visual</span>
-          </label>
-        </section>
-
+        <!-- ================= PRODUZIONE ================= -->
         <section class="view is-active" id="productionView">
-          <div class="split-layout">
-            <section class="table-panel" aria-label="Pipeline creativa">
-              <div class="panel-heading">
-                <h3>Pipeline</h3>
-                <span id="resultCount"></span>
-              </div>
-              <div class="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Campaign / Moment</th>
-                      <th>Asset Focus</th>
-                      <th>Go Live</th>
-                      <th>Deadline</th>
-                      <th>Country</th>
-                      <th>Campaign Type</th>
-                      <th>Product Category</th>
-                      <th>Product Cluster</th>
-                      <th>Format</th>
-                      <th>Status</th>
-                      <th>Visual</th>
-                    </tr>
-                  </thead>
-                  <tbody id="assetRows"></tbody>
-                </table>
-              </div>
-            </section>
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Produzione + performance intelligence</p>
+              <h2>Hub operativo ADV Creative</h2>
+            </div>
+            <div class="actions">
+              <button class="primary-button" type="button" id="newAssetButton" title="Crea un nuovo asset in produzione">+ Nuovo asset</button>
+              <button class="ghost-button" type="button" id="importPipelineCsv" title="Importa il CSV esportato dal tab ADV Pipeline">Import ADV Pipeline CSV</button>
+              <button class="ghost-button" type="button" id="exportCsv" title="Esporta pipeline in CSV">CSV</button>
+              <button class="primary-button" type="button" id="exportJson" title="Esporta stato completo con visual">JSON</button>
+              <input id="pipelineCsvInput" type="file" accept=".csv,text/csv" hidden />
+            </div>
+          </header>
 
-            <aside class="detail-panel" aria-live="polite">
-              <div id="emptyDetail" class="empty-detail">
-                <p class="eyebrow">Seleziona una riga</p>
-                <h3>Brief, upload e learning in un unico punto.</h3>
-              </div>
-              <div id="assetDetail" class="asset-detail" hidden></div>
-            </aside>
-          </div>
+          <p class="status-line" id="lastImportLine"></p>
+
+          <section class="kpis" aria-label="KPI pipeline">
+            <article class="kpi">
+              <span id="kpiTotal">0</span>
+              <p>Asset totali</p>
+            </article>
+            <article class="kpi accent">
+              <span id="kpiMissingVisual">0</span>
+              <p>Senza visual</p>
+            </article>
+            <article class="kpi">
+              <span id="kpiPerf">0</span>
+              <p>Con performance Meta</p>
+            </article>
+          </section>
+
+          <section class="toolbar" aria-label="Filtri">
+            <label class="field search-field">
+              <span>Cerca</span>
+              <input id="searchInput" type="search" placeholder="Asset focus, campagna, naming, hook, note..." />
+            </label>
+            <label class="field">
+              <span>Formato</span>
+              <select id="formatFilter"></select>
+            </label>
+            <label class="toggle">
+              <input id="missingVisualOnly" type="checkbox" />
+              <span>Solo senza visual</span>
+            </label>
+          </section>
+
+          <section class="table-panel" aria-label="Pipeline creativa">
+            <div class="panel-heading">
+              <h3>Pipeline</h3>
+              <span id="resultCount"></span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Campaign / Moment</th>
+                    <th>Asset Focus</th>
+                    <th>Go Live</th>
+                    <th>Deadline</th>
+                    <th>Country</th>
+                    <th>Campaign Type</th>
+                    <th>Product Category</th>
+                    <th>Product Cluster</th>
+                    <th>Format</th>
+                    <th>Status</th>
+                    <th>Visual</th>
+                  </tr>
+                </thead>
+                <tbody id="assetRows"></tbody>
+              </table>
+            </div>
+          </section>
         </section>
 
+        <!-- ================= ANALISI ================= -->
         <section class="view" id="analyticsView">
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Analisi</p>
+              <h2>Performance intelligence</h2>
+            </div>
+          </header>
+          <p class="status-line" id="analyticsStatusLine"></p>
+
           <div class="analytics-grid">
             <article class="insight-panel wide">
               <div class="panel-heading">
                 <h3>Format Scorecard</h3>
-                <span>da pipeline + benchmark</span>
               </div>
               <div id="formatScorecard" class="scorecard"></div>
             </article>
             <article class="insight-panel">
               <div class="panel-heading">
                 <h3>Production Mix</h3>
-                <span>asset aperti</span>
+                <span>per formato · asset aperti</span>
               </div>
-              <div id="mixChart" class="bar-list"></div>
+              <div class="donut-wrap">
+                <svg width="150" height="150" viewBox="0 0 42 42" id="mixDonut"></svg>
+                <div class="legend" id="mixLegend"></div>
+              </div>
             </article>
             <article class="insight-panel">
               <div class="panel-heading">
-                <h3>Priorità</h3>
-                <span>azioni immediate</span>
-              </div>
-              <div id="priorityList" class="priority-list"></div>
-            </article>
-            <article class="insight-panel wide">
-              <div class="panel-heading">
                 <h3>Meta Performance Import</h3>
-                <span id="performanceSummary">Nessun CSV importato</span>
+                <button class="ghost-button small-button" type="button" id="importMetaCsv" title="Importa export CSV da Meta Ads">Import Meta CSV</button>
+                <input id="metaCsvInput" type="file" accept=".csv,text/csv" hidden />
               </div>
+              <span class="performance-caption" id="performanceSummary">Nessun CSV importato</span>
               <div id="performanceInsights" class="performance-grid"></div>
             </article>
             <article class="insight-panel wide">
               <div class="panel-heading">
-                <h3>Raccomandazioni operative</h3>
-                <span>derivate dal report</span>
+                <h3>Note del team</h3>
+                <span>testo libero, modificabile — non generato dall'app</span>
               </div>
-              <div class="recommendations">
-                <p><strong>UGC primo asset da produrre.</strong> Botanica ha confermato che UGC su prospecting abbassa CPM e CPR rispetto al brand video sulla stessa audience fredda.</p>
-                <p><strong>GIF sempre in rt_.</strong> Il report statico mostra CPM GIF stabile e basso: ogni collection attiva dovrebbe avere almeno un loop retargeting.</p>
-                <p><strong>Carousel solo dove serve discovery.</strong> Tenere carousel su HP o warm audience, evitando cold PLP quando il CPR esplode.</p>
+              <div class="notes-panel">
+                <textarea id="teamNotes" placeholder="Es. UGC su prospecting abbassa CPM su audience fredda (Botanica, W29)..."></textarea>
               </div>
             </article>
           </div>
         </section>
 
+        <!-- ================= VISUAL LIBRARY ================= -->
         <section class="view" id="visualsView">
-          <div class="panel-heading library-heading">
-            <h3>Visual Library</h3>
-            <span id="libraryCount"></span>
-          </div>
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Visual Library</p>
+              <h2>Archivio creativo</h2>
+            </div>
+          </header>
+          <p class="status-line" id="libraryCount"></p>
+
+          <div class="format-stats" id="formatStats"></div>
+
           <div id="visualLibrary" class="visual-library"></div>
         </section>
       </main>
+    </div>
+
+    <!-- ================= POP-UP DETTAGLIO ASSET ================= -->
+    <div class="modal-backdrop" id="assetModalBackdrop" hidden>
+      <button class="modal-nav prev" type="button" id="modalPrev" aria-label="Asset precedente">‹</button>
+      <div class="asset-modal" id="assetModal">
+        <div class="modal-header">
+          <div>
+            <span class="pill" id="modalPill"></span>
+            <h3 id="modalTitle"></h3>
+          </div>
+          <button class="icon-close" type="button" id="modalClose" aria-label="Chiudi">×</button>
+        </div>
+        <div class="modal-scroll" id="assetDetail"></div>
+      </div>
+      <button class="modal-nav next" type="button" id="modalNext" aria-label="Asset successivo">›</button>
     </div>
 
     <div class="asset-drawer" id="assetDrawer" hidden>
@@ -325,10 +328,6 @@
                 <input name="visualFile" type="file" accept="image/*">
               </label>
             </div>
-            <label class="field full">
-              <span>ADV rationale</span>
-              <textarea name="rationale" rows="4" placeholder="Perche produrlo: benchmark, learning, funnel gap, occasione commerciale."></textarea>
-            </label>
           </div>
 
           <footer class="drawer-footer">
@@ -340,7 +339,7 @@
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script src="./seed-assets.js?v=20260810a"></script>
-    <script src="./app.js?v=20260810a"></script>
+    <script src="./seed-assets.js?v=20260814a"></script>
+    <script src="./app.js?v=20260814a"></script>
   </body>
 </html>
