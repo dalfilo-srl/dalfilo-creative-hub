@@ -255,7 +255,17 @@ function getFilteredAssets() {
     const matchesPriority = !els.priorityFilter.value || asset.priority === els.priorityFilter.value;
     const matchesVisual = !els.missingVisualOnly.checked || !asset.visual;
     return matchesQuery && matchesStatus && matchesFormat && matchesPriority && matchesVisual;
-  });
+  }).sort((a, b) => sortableDate(a.goLive) - sortableDate(b.goLive));
+}
+
+function sortableDate(value) {
+  const match = String(value || "").trim().match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+  if (!match) return Infinity;
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  let year = match[3] ? Number(match[3]) : new Date().getFullYear();
+  if (year < 100) year += 2000;
+  return year * 10000 + month * 100 + day;
 }
 
 function render() {
