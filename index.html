@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Dalfilo Creative Hub</title>
-    <link rel="stylesheet" href="./styles.css?v=20260814a" />
+    <link rel="stylesheet" href="./styles.css?v=20260814b" />
   </head>
   <body>
     <div class="app-shell">
@@ -47,6 +47,10 @@
             <div class="actions">
               <button class="primary-button" type="button" id="newAssetButton" title="Crea un nuovo asset in produzione">+ Nuovo asset</button>
               <button class="ghost-button" type="button" id="importPipelineCsv" title="Importa il CSV esportato dal tab ADV Pipeline">Import ADV Pipeline CSV</button>
+              <span class="health-trigger">
+                <button class="ghost-button" type="button" id="openHealthCheckBtn" title="Controlla corrispondenze, duplicati e dati mancanti tra CSV e app">🩺 Controllo dati</button>
+                <span class="health-badge" id="healthBadge">0</span>
+              </span>
               <button class="ghost-button" type="button" id="exportCsv" title="Esporta pipeline in CSV">CSV</button>
               <button class="primary-button" type="button" id="exportJson" title="Esporta stato completo con visual">JSON</button>
               <input id="pipelineCsvInput" type="file" accept=".csv,text/csv" hidden />
@@ -120,6 +124,12 @@
               <p class="eyebrow">Analisi</p>
               <h2>Performance intelligence</h2>
             </div>
+            <div class="actions">
+              <span class="health-trigger">
+                <button class="ghost-button" type="button" id="openMetaCheckBtn" title="Righe del CSV Meta senza asset collegato">🩺 Controllo Meta</button>
+                <span class="health-badge" id="metaBadge">0</span>
+              </span>
+            </div>
           </header>
           <p class="status-line" id="analyticsStatusLine"></p>
 
@@ -130,13 +140,13 @@
               </div>
               <div id="formatScorecard" class="scorecard"></div>
             </article>
-            <article class="insight-panel">
+            <article class="insight-panel mix-panel">
               <div class="panel-heading">
                 <h3>Production Mix</h3>
                 <span>per formato · asset aperti</span>
               </div>
               <div class="donut-wrap">
-                <svg width="150" height="150" viewBox="0 0 42 42" id="mixDonut"></svg>
+                <svg width="168" height="168" viewBox="0 0 42 42" id="mixDonut"></svg>
                 <div class="legend" id="mixLegend"></div>
               </div>
             </article>
@@ -172,6 +182,25 @@
           <p class="status-line" id="libraryCount"></p>
 
           <div class="format-stats" id="formatStats"></div>
+
+          <div class="library-toolbar">
+            <label class="field search-field">
+              <span>Cerca</span>
+              <input id="librarySearch" type="search" placeholder="Asset focus, campagna, naming...">
+            </label>
+            <label class="field">
+              <span>Formato</span>
+              <select id="libraryFormatFilter"></select>
+            </label>
+            <label class="field">
+              <span>Ordina per</span>
+              <select id="librarySort">
+                <option value="recent">Più recenti</option>
+                <option value="performance">Performance migliore</option>
+                <option value="campaign">Campagna</option>
+              </select>
+            </label>
+          </div>
 
           <div id="visualLibrary" class="visual-library"></div>
         </section>
@@ -338,8 +367,36 @@
       </aside>
     </div>
 
+    <!-- ================= DATA HEALTH CHECK: ADV Pipeline ================= -->
+    <div class="modal-backdrop" id="healthModalBackdrop" hidden>
+      <div class="asset-modal health-modal">
+        <div class="modal-header">
+          <div>
+            <span class="pill" style="background:var(--red);color:#fff;">🩺 Data Health Check</span>
+            <h3>Riconciliazione CSV Pipeline ↔ App</h3>
+          </div>
+          <button class="icon-close" type="button" id="healthModalClose" aria-label="Chiudi">×</button>
+        </div>
+        <div class="modal-scroll" id="healthModalBody"></div>
+      </div>
+    </div>
+
+    <!-- ================= DATA HEALTH CHECK: Meta CSV ================= -->
+    <div class="modal-backdrop" id="metaModalBackdrop" hidden>
+      <div class="asset-modal health-modal">
+        <div class="modal-header">
+          <div>
+            <span class="pill" style="background:var(--red);color:#fff;">🩺 Data Health Check</span>
+            <h3>Righe Meta senza corrispondenza asset</h3>
+          </div>
+          <button class="icon-close" type="button" id="metaModalClose" aria-label="Chiudi">×</button>
+        </div>
+        <div class="modal-scroll" id="metaModalBody"></div>
+      </div>
+    </div>
+
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script src="./seed-assets.js?v=20260814a"></script>
-    <script src="./app.js?v=20260814a"></script>
+    <script src="./seed-assets.js?v=20260814b"></script>
+    <script src="./app.js?v=20260814b"></script>
   </body>
 </html>

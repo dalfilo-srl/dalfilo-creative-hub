@@ -69,7 +69,14 @@ let selectedId = assets[0]?.id || null;
 let modalAssetId = null;
 let currentView = "production";
 let editingAssetId = null;
-let lastPipelineImportAt = loadLastImportTimestamp();
+const appState = loadAppState();
+let lastPipelineImportAt = appState.lastPipelineImportAt;
+let lastImportCampaigns = appState.lastImportCampaigns;
+let ignoredDuplicatePairs = appState.ignoredDuplicatePairs;
+let ignoredMetaAdNames = appState.ignoredMetaAdNames;
+let unmatchedMetaRows = appState.unmatchedMetaRows;
+let lastPipelineImportStats = appState.lastPipelineImportStats;
+let lastMetaImportStats = appState.lastMetaImportStats;
 
 const els = {
   rows: document.getElementById("assetRows"),
@@ -89,7 +96,20 @@ const els = {
   modalPill: document.getElementById("modalPill"),
   modalTitle: document.getElementById("modalTitle"),
   modalClose: document.getElementById("modalClose"),
-  teamNotes: document.getElementById("teamNotes")
+  teamNotes: document.getElementById("teamNotes"),
+  healthModalBackdrop: document.getElementById("healthModalBackdrop"),
+  healthModalClose: document.getElementById("healthModalClose"),
+  healthModalBody: document.getElementById("healthModalBody"),
+  healthBadge: document.getElementById("healthBadge"),
+  openHealthCheckBtn: document.getElementById("openHealthCheckBtn"),
+  metaModalBackdrop: document.getElementById("metaModalBackdrop"),
+  metaModalClose: document.getElementById("metaModalClose"),
+  metaModalBody: document.getElementById("metaModalBody"),
+  metaBadge: document.getElementById("metaBadge"),
+  openMetaCheckBtn: document.getElementById("openMetaCheckBtn"),
+  librarySearch: document.getElementById("librarySearch"),
+  libraryFormatFilter: document.getElementById("libraryFormatFilter"),
+  librarySort: document.getElementById("librarySort")
 };
 
 let namingTouched = false;
@@ -144,7 +164,13 @@ function normalizeAssetDefaults(asset) {
     performance: asset.performance || null,
     visual: asset.visual || "",
     visualName: asset.visualName || "",
-    isNew: asset.isNew || false
+    isNew: asset.isNew || false,
+    archived: asset.archived || false,
+    // true only once an asset has originated from, or been matched by, a CSV pipeline
+    // import — manually created assets stay exempt from the "missing from CSV" orphan check.
+    pipelineTracked: asset.pipelineTracked || false,
+    lastSeenImportAt: asset.lastSeenImportAt || null,
+    healthIgnored: asset.healthIgnored || {}
   };
 }
 
@@ -164,17 +190,44 @@ function mergePreservedAssetState(targetAssets, previousAssets) {
 }
 
 function saveAssets() {
-  localStorage.setItem(storageKey, JSON.stringify({ assets, savedAt: new Date().toISOString(), lastPipelineImportAt }));
+  localStorage.setItem(storageKey, JSON.stringify({
+    assets,
+    savedAt: new Date().toISOString(),
+    lastPipelineImportAt,
+    lastImportCampaigns,
+    ignoredDuplicatePairs,
+    ignoredMetaAdNames,
+    unmatchedMetaRows,
+    lastPipelineImportStats,
+    lastMetaImportStats
+  }));
 }
 
-function loadLastImportTimestamp() {
+function loadAppState() {
+  const defaults = {
+    lastPipelineImportAt: null,
+    lastImportCampaigns: [],
+    ignoredDuplicatePairs: [],
+    ignoredMetaAdNames: [],
+    unmatchedMetaRows: [],
+    lastPipelineImportStats: null,
+    lastMetaImportStats: null
+  };
   const saved = localStorage.getItem(storageKey);
-  if (!saved) return null;
+  if (!saved) return defaults;
   try {
     const parsed = JSON.parse(saved);
-    return parsed.lastPipelineImportAt || null;
+    return {
+      lastPipelineImportAt: parsed.lastPipelineImportAt || defaults.lastPipelineImportAt,
+      lastImportCampaigns: Array.isArray(parsed.lastImportCampaigns) ? parsed.lastImportCampaigns : defaults.lastImportCampaigns,
+      ignoredDuplicatePairs: Array.isArray(parsed.ignoredDuplicatePairs) ? parsed.ignoredDuplicatePairs : defaults.ignoredDuplicatePairs,
+      ignoredMetaAdNames: Array.isArray(parsed.ignoredMetaAdNames) ? parsed.ignoredMetaAdNames : defaults.ignoredMetaAdNames,
+      unmatchedMetaRows: Array.isArray(parsed.unmatchedMetaRows) ? parsed.unmatchedMetaRows : defaults.unmatchedMetaRows,
+      lastPipelineImportStats: parsed.lastPipelineImportStats || defaults.lastPipelineImportStats,
+      lastMetaImportStats: parsed.lastMetaImportStats || defaults.lastMetaImportStats
+    };
   } catch {
-    return null;
+    return defaults;
   }
 }
 
@@ -190,9 +243,14 @@ function init() {
   bindNavigation();
   bindActions();
   bindModal();
+  bindHealthModal();
+  bindMetaModal();
   populateFilters();
   els.teamNotes.value = loadTeamNotes();
   els.teamNotes.addEventListener("input", (event) => saveTeamNotes(event.target.value));
+  [els.librarySearch, els.libraryFormatFilter, els.librarySort].forEach((control) => {
+    control.addEventListener("input", renderVisualLibrary);
+  });
   render();
 }
 
@@ -220,6 +278,12 @@ function bindActions() {
     assets = structuredClone(seedAssets);
     selectedId = assets[0].id;
     lastPipelineImportAt = null;
+    lastImportCampaigns = [];
+    ignoredDuplicatePairs = [];
+    ignoredMetaAdNames = [];
+    unmatchedMetaRows = [];
+    lastPipelineImportStats = null;
+    lastMetaImportStats = null;
     saveAssets();
     populateFilters();
     closeAssetModal();
@@ -231,6 +295,8 @@ function bindActions() {
   els.pipelineCsvInput.addEventListener("change", handlePipelineCsvImport);
   document.getElementById("importMetaCsv").addEventListener("click", () => els.metaCsvInput.click());
   els.metaCsvInput.addEventListener("change", handleMetaCsvImport);
+  els.openHealthCheckBtn.addEventListener("click", openHealthModal);
+  els.openMetaCheckBtn.addEventListener("click", openMetaModal);
   document.getElementById("newAssetButton").addEventListener("click", openNewAssetDrawer);
   els.assetForm.addEventListener("submit", handleAssetSubmit);
   els.assetForm.naming.addEventListener("input", () => {
@@ -248,6 +314,7 @@ function bindActions() {
 
 function populateFilters() {
   fillSelect(els.formatFilter, ["Tutti i format", ...unique("format")]);
+  fillSelect(els.libraryFormatFilter, ["Tutti i format", ...unique("format")]);
 }
 
 function fillSelect(select, values) {
@@ -255,12 +322,12 @@ function fillSelect(select, values) {
 }
 
 function unique(key) {
-  return [...new Set(assets.map((asset) => asset[key]).filter(Boolean))].sort();
+  return [...new Set(activeAssets().map((asset) => asset[key]).filter(Boolean))].sort();
 }
 
 function getFilteredAssets() {
   const query = els.search.value.trim().toLowerCase();
-  return assets.filter((asset) => {
+  return activeAssets().filter((asset) => {
     const text = [
       asset.campaign,
       asset.assetName,
@@ -301,12 +368,14 @@ function render() {
   if (currentView === "analytics") renderAnalytics();
   if (currentView === "visuals") renderVisualLibrary();
   if (modalAssetId) renderModalContent();
+  updateHealthBadges();
 }
 
 function renderKpis() {
-  setText("kpiTotal", assets.length);
-  setText("kpiMissingVisual", assets.filter((asset) => !asset.visual && asset.status !== "Done").length);
-  setText("kpiPerf", assets.filter((asset) => asset.performance).length);
+  const open = activeAssets();
+  setText("kpiTotal", open.length);
+  setText("kpiMissingVisual", open.filter((asset) => !asset.visual && asset.status !== "Done").length);
+  setText("kpiPerf", open.filter((asset) => asset.performance).length);
   renderLastImportLine();
 }
 
@@ -681,7 +750,11 @@ function buildAssetFromForm(formData, existingAsset = null) {
     notes: existingAsset?.notes || "",
     performance: existingAsset?.performance || null,
     visual: existingAsset?.visual || "",
-    visualName: existingAsset?.visualName || ""
+    visualName: existingAsset?.visualName || "",
+    archived: existingAsset?.archived || false,
+    pipelineTracked: existingAsset?.pipelineTracked || false,
+    lastSeenImportAt: existingAsset?.lastSeenImportAt || null,
+    healthIgnored: existingAsset?.healthIgnored || {}
   };
 }
 
@@ -864,21 +937,29 @@ function renderScorecard() {
   const container = document.getElementById("formatScorecard");
   const formats = ["Video", "Static", "GIF", "Carousel"];
   container.innerHTML = formats.map((format) => {
-    const items = assets.filter((asset) => asset.format === format);
+    const items = activeAssets().filter((asset) => asset.format === format);
     const missingVisuals = items.filter((asset) => !asset.visual && asset.status !== "Done").length;
     return `
       <div class="scorecard-card">
         <span class="pill ${format.toLowerCase()}">${format}</span>
         <strong>${items.length} asset · ${missingVisuals} senza visual</strong>
+        <p>${bestPerformerLine(items)}</p>
       </div>
     `;
   }).join("");
 }
 
+function bestPerformerLine(items) {
+  const withPerf = items.filter((asset) => asset.performance && asset.performance.cpr);
+  if (!withPerf.length) return "Nessun dato performance ancora";
+  const best = [...withPerf].sort((a, b) => a.performance.cpr - b.performance.cpr)[0];
+  return `🏆 ${escapeHtml(best.assetName)} · ${formatMetric(best.performance.cpr, "currency")} CPR`;
+}
+
 function renderMixChart() {
   const svg = document.getElementById("mixDonut");
   const legend = document.getElementById("mixLegend");
-  const open = assets.filter((asset) => asset.status !== "Done");
+  const open = activeAssets().filter((asset) => asset.status !== "Done");
   const colors = { Static: "#a8522e", GIF: "#af8427", Video: "#47745a", Carousel: "#315f85" };
   const counts = countBy(open, "format");
   const data = Object.entries(counts)
@@ -915,7 +996,7 @@ function renderMixChart() {
 }
 
 function renderPerformanceInsights() {
-  const matched = assets.filter((asset) => asset.performance);
+  const matched = activeAssets().filter((asset) => asset.performance);
   const summary = document.getElementById("performanceSummary");
   const container = document.getElementById("performanceInsights");
 
@@ -952,16 +1033,40 @@ function renderPerformanceInsights() {
 }
 
 function renderVisualLibrary() {
-  const withVisual = assets.filter((asset) => asset.visual);
-  document.getElementById("libraryCount").innerHTML = `<strong>${withVisual.length}</strong> visual caricati su ${assets.length} asset`;
+  const open = activeAssets();
+  const withVisual = open.filter((asset) => asset.visual);
+  document.getElementById("libraryCount").innerHTML = `<strong>${withVisual.length}</strong> visual caricati su ${open.length} asset`;
 
   const formats = ["Video", "Static", "GIF", "Carousel"];
   document.getElementById("formatStats").innerHTML = formats.map((format) => {
-    const count = assets.filter((asset) => asset.format === format).length;
+    const count = open.filter((asset) => asset.format === format).length;
     return `<div><strong>${count}</strong><small>${escapeHtml(format)}</small></div>`;
   }).join("");
 
-  document.getElementById("visualLibrary").innerHTML = withVisual.length ? withVisual.map((asset) => `
+  const query = (els.librarySearch.value || "").trim().toLowerCase();
+  const formatValue = els.libraryFormatFilter.value;
+  const sortValue = els.librarySort.value;
+
+  let filtered = withVisual.filter((asset) => {
+    const text = [asset.assetName, asset.campaign, asset.naming, asset.notes].join(" ").toLowerCase();
+    const matchesQuery = !query || text.includes(query);
+    const matchesFormat = !formatValue || asset.format === formatValue;
+    return matchesQuery && matchesFormat;
+  });
+
+  if (sortValue === "performance") {
+    filtered = [...filtered].sort((a, b) => {
+      const aCpr = a.performance?.cpr ?? Infinity;
+      const bCpr = b.performance?.cpr ?? Infinity;
+      return aCpr - bCpr;
+    });
+  } else if (sortValue === "campaign") {
+    filtered = [...filtered].sort((a, b) => (a.campaign || "").localeCompare(b.campaign || ""));
+  }
+  // "recent" (default) keeps the natural array order: newly created/imported assets
+  // are unshifted to the front, so it already reads most-recent-first.
+
+  document.getElementById("visualLibrary").innerHTML = filtered.length ? filtered.map((asset) => `
     <article class="visual-card">
       <img src="${asset.visual}" alt="${escapeHtml(asset.assetName)}">
       <div>
@@ -971,7 +1076,7 @@ function renderVisualLibrary() {
         <small>${escapeHtml(asset.notes || "Nessun learning ancora")}</small>
       </div>
     </article>
-  `).join("") : `<article class="priority-card"><strong>Nessun visual caricato.</strong><p>Apri Produzione e carica un'immagine su una riga specifica.</p></article>`;
+  `).join("") : `<article class="priority-card"><strong>Nessun visual trovato.</strong><p>${withVisual.length ? "Prova a modificare i filtri di ricerca." : "Apri Produzione e carica un'immagine su una riga specifica."}</p></article>`;
 }
 
 function handlePipelineCsvImport(event) {
@@ -981,36 +1086,59 @@ function handlePipelineCsvImport(event) {
   const reader = new FileReader();
   reader.onload = () => {
     const rows = parseCsv(String(reader.result || ""));
-    const result = applyPipelineRows(rows);
-    lastPipelineImportAt = new Date().toISOString();
+    const importTimestamp = new Date().toISOString();
+    const campaignsSeen = [...new Set(rows.map((row) => findValue(row, CAMPAIGN_HEADER_CANDIDATES)).filter(Boolean))];
+    const result = applyPipelineRows(rows, importTimestamp);
+    lastPipelineImportAt = importTimestamp;
+    lastImportCampaigns = campaignsSeen;
+    lastPipelineImportStats = { rows: rows.length, created: result.created, updated: result.updated };
     saveAssets();
     populateFilters();
     render();
-    showToast(`${result.created} creati · ${result.updated} aggiornati dal tab ADV Pipeline.`);
+    const anomalies = countOpenAnomalies();
+    showToast(`${result.created} creati · ${result.updated} aggiornati dal tab ADV Pipeline${anomalies ? ` · ${anomalies} anomalie rilevate` : ""}.`);
+    if (anomalies > 0) {
+      setTimeout(openHealthModal, 500);
+    }
     els.pipelineCsvInput.value = "";
   };
   reader.readAsText(file);
 }
 
-function applyPipelineRows(rows) {
+function applyPipelineRows(rows, importTimestamp) {
   let created = 0;
   let updated = 0;
 
   rows.map(normalizePipelineRow).filter(Boolean).forEach((incoming) => {
+    incoming.lastSeenImportAt = importTimestamp;
+    incoming.pipelineTracked = true;
+
     const existing = findAssetForPipelineImport(incoming);
     if (existing) {
       Object.assign(existing, {
         ...incoming,
         id: existing.id,
+        // Protect a naming already filled in (manually or via Health Check) from being
+        // blanked out by a re-import whose source sheet still has that cell empty.
+        naming: incoming.naming || existing.naming,
+        // Same protection for campaign: a blank cell in a re-import should never erase
+        // a campaign name the asset already has.
+        campaign: incoming.campaign || existing.campaign,
         notes: existing.notes || incoming.notes || "",
         performance: existing.performance || null,
         visual: existing.visual || "",
         visualName: existing.visualName || "",
-        isNew: existing.isNew || false
+        isNew: existing.isNew || false,
+        archived: existing.archived || false,
+        // The asset was just re-confirmed by a fresh import, so any previous
+        // "keep even though missing from CSV" orphan dismissal no longer applies.
+        healthIgnored: { ...(existing.healthIgnored || {}), orphan: false }
       });
       updated += 1;
     } else {
       incoming.isNew = true;
+      incoming.archived = false;
+      incoming.healthIgnored = {};
       assets.unshift(incoming);
       created += 1;
     }
@@ -1020,16 +1148,24 @@ function applyPipelineRows(rows) {
   return { created, updated };
 }
 
+// Note: deliberately no bare "campaign" candidate — it fuzzy-matches the unrelated
+// "Campaign Type" column (an actual real-world CSV collision found via testing) and
+// would silently pull the wrong cell into the campaign field whenever "Campaign / Moment"
+// is blank.
+const CAMPAIGN_HEADER_CANDIDATES = ["campaign / moment", "campagna", "moment", "fase", "initiative"];
+
 function normalizePipelineRow(row) {
   const assetName = findValue(row, ["asset focus", "focus asset", "asset name", "asset", "creative", "creative name", "nome asset", "contenuto"]);
-  const campaign = findValue(row, ["campaign / moment", "campaign", "moment", "campagna", "fase", "initiative"]);
+  const campaign = findValue(row, CAMPAIGN_HEADER_CANDIDATES);
   const naming = findValue(row, ["naming convention", "naming", "ad name", "ad_name", "nome inserzione"]);
 
   if (!assetName && !campaign && !naming) return null;
 
   return {
     id: makeAssetId(),
-    campaign: campaign || "Imported pipeline",
+    // Leave a genuinely blank CSV cell blank rather than papering over it with a
+    // placeholder — an empty campaign should surface in the Health Check, not hide.
+    campaign: campaign || "",
     goLive: findValue(row, ["go live", "go-live", "live date", "data live", "start", "launch date"]),
     deadline: findValue(row, ["deadline", "due date", "scadenza", "delivery date"]),
     country: findValue(row, ["country", "paese", "market", "mercato"]),
@@ -1108,37 +1244,61 @@ function handleMetaCsvImport(event) {
   reader.onload = () => {
     const rows = parseCsv(String(reader.result || ""));
     const result = applyMetaRows(rows, file.name);
+    lastMetaImportStats = { rows: rows.length, matched: result.matched, unmatched: result.unmatched };
     saveAssets();
     render();
-    showToast(`${result.matched} asset matchati da ${file.name}.`);
+    showToast(`${result.matched} asset matchati da ${file.name}${result.unmatched ? ` · ${result.unmatched} righe senza corrispondenza` : ""}.`);
+    if (result.unmatched > 0) {
+      setTimeout(openMetaModal, 500);
+    }
     els.metaCsvInput.value = "";
   };
   reader.readAsText(file);
 }
 
+const META_ADNAME_CANDIDATES = ["ad name", "ad_name", "ad", "nome inserzione", "inserzione"];
+
 function applyMetaRows(rows, fileName) {
   const matchedAssetIds = new Set();
+  const stillUnmatched = [];
+
   rows.forEach((row) => {
-    const adName = findValue(row, ["ad name", "ad_name", "ad", "nome inserzione", "inserzione"]);
+    const adName = findValue(row, META_ADNAME_CANDIDATES);
     if (!adName) return;
 
-    const asset = findAssetByAdName(adName);
-    if (!asset) return;
-
     const performance = normalizePerformance(row, adName, fileName);
-    asset.performance = performance;
-    matchedAssetIds.add(asset.id);
+    const asset = findAssetByAdName(adName);
+    if (asset) {
+      asset.performance = performance;
+      matchedAssetIds.add(asset.id);
+      return;
+    }
+
+    // Never silently drop Meta spend/performance data: a row with no matching asset
+    // is queued for manual review in the Meta Health Check instead of being discarded.
+    const normalizedAdName = normalizeKey(adName);
+    if (ignoredMetaAdNames.includes(normalizedAdName)) return;
+    stillUnmatched.push({ adName, normalizedAdName, performance });
   });
 
-  return { matched: matchedAssetIds.size };
+  unmatchedMetaRows = stillUnmatched;
+  return { matched: matchedAssetIds.size, unmatched: unmatchedMetaRows.length };
 }
 
 function findAssetByAdName(adName) {
   const normalizedAdName = normalizeKey(adName);
+  if (!normalizedAdName) return null;
+  // Guard against blank/very short naming or asset names: "".includes("") (and any
+  // short generic fragment) would otherwise match almost anything, silently
+  // misattributing Meta spend/performance to the wrong asset.
+  const MIN_MATCH_LENGTH = 6;
   return assets.find((asset) => {
     const naming = normalizeKey(asset.naming);
     const assetName = normalizeKey(asset.assetName);
-    return normalizedAdName === naming || normalizedAdName.includes(naming) || naming.includes(normalizedAdName) || normalizedAdName.includes(assetName);
+    const namingMatch = naming.length >= MIN_MATCH_LENGTH
+      && (normalizedAdName === naming || normalizedAdName.includes(naming) || naming.includes(normalizedAdName));
+    const assetNameMatch = assetName.length >= MIN_MATCH_LENGTH && normalizedAdName.includes(assetName);
+    return namingMatch || assetNameMatch;
   });
 }
 
@@ -1183,6 +1343,115 @@ function performanceInsight(perf) {
   return "Da monitorare nel prossimo export: performance non estrema, utile confronto con benchmark formato/funnel.";
 }
 
+// ==================== Data Health Check: anomaly detection ====================
+
+function activeAssets() {
+  return assets.filter((asset) => !asset.archived);
+}
+
+function pairKeyStr(a, b) {
+  return [a.id, b.id].sort().join("|");
+}
+
+function bigrams(value) {
+  const text = normalizeKey(value).replace(/_/g, "");
+  const grams = [];
+  for (let i = 0; i < text.length - 1; i += 1) grams.push(text.slice(i, i + 2));
+  return grams;
+}
+
+function diceCoefficient(a, b) {
+  const bigramsA = bigrams(a);
+  const bigramsB = bigrams(b);
+  if (!bigramsA.length || !bigramsB.length) return 0;
+  const pool = new Map();
+  bigramsB.forEach((gram) => pool.set(gram, (pool.get(gram) || 0) + 1));
+  let matches = 0;
+  bigramsA.forEach((gram) => {
+    const count = pool.get(gram) || 0;
+    if (count > 0) {
+      matches += 1;
+      pool.set(gram, count - 1);
+    }
+  });
+  return (2 * matches) / (bigramsA.length + bigramsB.length);
+}
+
+function computeDuplicateGroups() {
+  const candidates = activeAssets();
+  const pairs = [];
+  const seenKeys = new Set();
+
+  const addPair = (a, b, reason, similarity) => {
+    const key = pairKeyStr(a, b);
+    if (seenKeys.has(key) || ignoredDuplicatePairs.includes(key)) return;
+    seenKeys.add(key);
+    pairs.push({ a, b, reason, similarity, key });
+  };
+
+  const byNaming = new Map();
+  candidates.forEach((asset) => {
+    const key = normalizeKey(asset.naming);
+    if (!key) return;
+    if (!byNaming.has(key)) byNaming.set(key, []);
+    byNaming.get(key).push(asset);
+  });
+  byNaming.forEach((group) => {
+    if (group.length < 2) return;
+    for (let i = 0; i < group.length; i += 1) {
+      for (let j = i + 1; j < group.length; j += 1) {
+        addPair(group[i], group[j], "Naming identico dopo la normalizzazione → quasi certamente lo stesso asset", 1);
+      }
+    }
+  });
+
+  const byBucket = new Map();
+  candidates.forEach((asset) => {
+    const bucketKey = `${normalizeKey(asset.campaign)}|${asset.format}|${normalizeKey(asset.goLive)}`;
+    if (!byBucket.has(bucketKey)) byBucket.set(bucketKey, []);
+    byBucket.get(bucketKey).push(asset);
+  });
+  byBucket.forEach((group) => {
+    if (group.length < 2) return;
+    for (let i = 0; i < group.length; i += 1) {
+      for (let j = i + 1; j < group.length; j += 1) {
+        const a = group[i];
+        const b = group[j];
+        if (seenKeys.has(pairKeyStr(a, b))) continue;
+        const similarity = diceCoefficient(a.assetName, b.assetName);
+        if (similarity >= 0.8) {
+          addPair(a, b, `Naming diverso ma stessa campagna + formato + go live → ${Math.round(similarity * 100)}% di somiglianza sul testo dell'Asset Focus`, similarity);
+        }
+      }
+    }
+  });
+
+  return pairs;
+}
+
+function computeOrphans() {
+  if (!lastPipelineImportAt) return [];
+  return activeAssets().filter((asset) => asset.pipelineTracked
+    && asset.lastSeenImportAt !== lastPipelineImportAt
+    && !(asset.healthIgnored && asset.healthIgnored.orphan));
+}
+
+function computeCampaignIssues() {
+  return activeAssets().filter((asset) => {
+    const empty = !asset.campaign;
+    const unrecognized = lastImportCampaigns.length > 0 && asset.campaign && !lastImportCampaigns.includes(asset.campaign);
+    return empty || unrecognized;
+  });
+}
+
+function computeMissingNaming() {
+  return activeAssets().filter((asset) => !asset.naming);
+}
+
+function countOpenAnomalies() {
+  return computeDuplicateGroups().length + computeOrphans().length + computeCampaignIssues().length + computeMissingNaming().length;
+}
+
 function parseCsv(text) {
   const lines = [];
   let row = [];
@@ -1221,7 +1490,7 @@ function parseCsv(text) {
 
   const headers = lines[headerIndex].map((header) => normalizeHeader(header));
   return lines.slice(headerIndex + 1).map((line) => headers.reduce((acc, header, index) => {
-    acc[header] = line[index] || "";
+    acc[header] = String(line[index] || "").trim();
     acc.__cells = line;
     return acc;
   }, {}));
@@ -1233,7 +1502,16 @@ function findCsvHeaderIndex(lines) {
     const hasCampaign = headers.some((header) => header.includes("campaign") || header.includes("campagna"));
     const hasAsset = headers.some((header) => header.includes("asset"));
     const hasFormat = headers.some((header) => header.includes("format") || header.includes("formato"));
-    return hasCampaign && hasAsset && hasFormat;
+    const isPipelineHeader = hasCampaign && hasAsset && hasFormat;
+
+    // A real Meta Ads Manager export never has "asset"/"format" columns — its header
+    // row instead always carries an ad name plus a spend/results metric. Recognizing
+    // that shape too means the same CSV parser handles both import types.
+    const hasAdName = headers.some((header) => header.includes("ad name") || header.includes("ad_name") || header.includes("nome inserzione"));
+    const hasMetaMetric = headers.some((header) => header.includes("amount spent") || header.includes("impressions") || header.includes("cost per result") || header.includes("spesa") || header.includes("risultati"));
+    const isMetaHeader = hasAdName && hasMetaMetric;
+
+    return isPipelineHeader || isMetaHeader;
   });
 }
 
@@ -1345,6 +1623,465 @@ function showToast(message) {
   els.toast.classList.add("is-visible");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => els.toast.classList.remove("is-visible"), 2200);
+}
+
+// ==================== Data Health Check: ADV Pipeline modal ====================
+
+function bindHealthModal() {
+  els.healthModalClose.addEventListener("click", closeHealthModal);
+  els.healthModalBackdrop.addEventListener("click", (event) => {
+    if (event.target === els.healthModalBackdrop) closeHealthModal();
+  });
+  els.healthModalBody.addEventListener("click", handleHealthModalClick);
+}
+
+function openHealthModal() {
+  renderHealthCheck();
+  els.healthModalBackdrop.hidden = false;
+}
+
+function closeHealthModal() {
+  els.healthModalBackdrop.hidden = true;
+}
+
+function renderHealthCheck() {
+  const duplicates = computeDuplicateGroups();
+  const orphans = computeOrphans();
+  const campaignIssues = computeCampaignIssues();
+  const namingIssues = computeMissingNaming();
+  const totalAnomalies = duplicates.length + orphans.length + campaignIssues.length + namingIssues.length;
+  const stats = lastPipelineImportStats;
+
+  els.healthModalBody.innerHTML = `
+    <div class="summary-strip">
+      <div class="summary-tile"><span>${stats ? stats.rows : "–"}</span><p>Righe nel CSV importato</p></div>
+      <div class="summary-tile"><span>${activeAssets().length}</span><p>Asset nell'app</p></div>
+      <div class="summary-tile"><span>${stats ? stats.updated : "–"}</span><p>Corrispondenze confermate</p></div>
+      <div class="summary-tile alert"><span id="healthTotalCount">${totalAnomalies}</span><p>Anomalie da rivedere</p></div>
+    </div>
+
+    <div class="hc-section">
+      <div class="hc-section-heading">
+        <div><h3>Possibili duplicati</h3><p>Stesso concetto creativo, probabilmente da due import diversi</p></div>
+        <span class="count-pill">${duplicates.length}</span>
+      </div>
+      <div class="hc-section-body">
+        ${duplicates.length ? duplicates.map(dupPairTemplate).join("") : `<p class="hc-empty">Nessun duplicato rilevato.</p>`}
+      </div>
+    </div>
+
+    <div class="hc-section">
+      <div class="hc-section-heading">
+        <div><h3>Asset non presenti nell'ultimo CSV importato</h3><p>Erano nel foglio prima, ora non ci sono più</p></div>
+        <span class="count-pill">${orphans.length}</span>
+      </div>
+      <div class="hc-section-body">
+        ${orphans.length ? orphans.map(orphanRowTemplate).join("") : `<p class="hc-empty">Nessun asset orfano rispetto all'ultimo import.</p>`}
+      </div>
+      <p class="hc-legend-note"><strong>Nota:</strong> "Archivia" non cancella — nasconde dalla tabella e resta nell'export JSON/CSV. Nessun visual o performance viene mai eliminato.</p>
+    </div>
+
+    <div class="hc-section">
+      <div class="hc-section-heading">
+        <div><h3>Campagna mancante o non riconosciuta</h3><p>Vuota, oppure non corrisponde a nessuna campagna del CSV più recente</p></div>
+        <span class="count-pill">${campaignIssues.length}</span>
+      </div>
+      <div class="hc-section-body">
+        ${campaignIssues.length ? campaignIssues.map(campaignRowTemplate).join("") : `<p class="hc-empty">Tutte le campagne corrispondono al CSV più recente.</p>`}
+      </div>
+    </div>
+
+    <div class="hc-section">
+      <div class="hc-section-heading">
+        <div><h3>Naming mancante o da assegnare</h3><p>Naming vuoto — finché resta vuoto, l'asset non può collegarsi in automatico a un import Meta CSV</p></div>
+        <span class="count-pill">${namingIssues.length}</span>
+      </div>
+      <div class="hc-section-body">
+        ${namingIssues.length ? namingIssues.map(namingRowTemplate).join("") : `<p class="hc-empty">Tutti gli asset hanno un naming assegnato.</p>`}
+      </div>
+      <p class="hc-legend-note"><strong>Nota:</strong> scrivendolo qui lo salvi subito, senza dover reimportare il CSV. L'app protegge questo valore: se il prossimo CSV ha ancora la cella vuota, non lo sovrascrive.</p>
+    </div>
+
+    <div class="hc-footer">
+      <p class="safety-note"><strong>Garanzia:</strong> in ogni unione o correzione, l'app tiene sempre la versione con visual, note o performance già collegati. Nessuna azione qui è distruttiva senza conferma.</p>
+      <div class="hc-footer-actions">
+        <button class="ghost-button" type="button" id="healthCloseBtn2">Chiudi e rivedi più tardi</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById("healthCloseBtn2").addEventListener("click", closeHealthModal);
+}
+
+function dupPairTemplate(pair) {
+  const { a, b, reason, key } = pair;
+  return `
+    <div class="dup-pair" data-pair-key="${escapeAttr(key)}">
+      <div class="dup-pair-header">${escapeHtml(reason)}</div>
+      <div class="dup-cards">
+        ${dupCardTemplate(a)}
+        ${dupCardTemplate(b)}
+      </div>
+      <div class="dup-actions">
+        <button class="primary-button" type="button" data-action="merge-duplicate" data-keep="${a.id}" data-merge="${b.id}">Tieni la sinistra, unisci la destra</button>
+        <button class="ghost-button" type="button" data-action="merge-duplicate" data-keep="${b.id}" data-merge="${a.id}">Tieni la destra, unisci la sinistra</button>
+        <button class="small-link" type="button" data-action="ignore-duplicate" data-pair-key="${escapeAttr(key)}">Non sono duplicati, ignora</button>
+      </div>
+    </div>
+  `;
+}
+
+function dupCardTemplate(asset) {
+  const flags = [asset.visual ? `<span class="flag has-visual">Ha visual</span>` : `<span class="flag no-visual">Senza visual</span>`];
+  if (asset.performance) flags.push(`<span class="flag has-perf">Ha performance Meta</span>`);
+  return `
+    <div class="dup-card">
+      <span class="pill ${asset.format.toLowerCase()}">${escapeHtml(asset.format)}</span>
+      <strong>${escapeHtml(asset.assetName)}</strong>
+      <small>${escapeHtml(asset.campaign || "-")} · Go live ${escapeHtml(asset.goLive || "-")}</small>
+      <small>Naming: ${escapeHtml(asset.naming || "(vuoto)")}</small>
+      <div class="flags">${flags.join("")}</div>
+    </div>
+  `;
+}
+
+function orphanRowTemplate(asset) {
+  const detail = `Campagna: ${asset.campaign || "(vuota)"} · ${asset.visual ? "Ha visual caricato" : "Senza visual"}`;
+  return `
+    <div class="hc-row" data-id="${asset.id}">
+      <div class="info"><strong>${escapeHtml(asset.assetName)}</strong><small>${escapeHtml(detail)}</small></div>
+      <div class="row-actions">
+        <button class="ghost-button" type="button" data-action="orphan-keep" data-id="${asset.id}">Mantieni</button>
+        <button class="primary-button" type="button" data-action="orphan-archive" data-id="${asset.id}" style="background:var(--red)">Archivia</button>
+      </div>
+      <span class="resolved-tag"></span>
+    </div>
+  `;
+}
+
+function campaignRowTemplate(asset) {
+  const currentLabel = asset.campaign ? `"${asset.campaign}"` : "(vuota)";
+  const options = lastImportCampaigns.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join("");
+  return `
+    <div class="hc-row" data-id="${asset.id}">
+      <div class="info"><strong>${escapeHtml(asset.assetName)}</strong><small>Campagna attuale: ${escapeHtml(currentLabel)}</small></div>
+      <div class="row-actions">
+        <select data-role="campaign-select">
+          <option value="">Assegna a una campagna del CSV attuale...</option>
+          ${options}
+        </select>
+        <button class="primary-button" type="button" data-action="apply-campaign" data-id="${asset.id}">Applica</button>
+      </div>
+      <span class="resolved-tag">✓ Corretto</span>
+    </div>
+  `;
+}
+
+function namingRowTemplate(asset) {
+  return `
+    <div class="hc-row" data-id="${asset.id}">
+      <div class="info"><strong>${escapeHtml(asset.assetName)}</strong><small>${escapeHtml(asset.campaign || "-")} · ${escapeHtml(asset.format)} · naming ancora da assegnare</small></div>
+      <div class="row-actions">
+        <input type="text" data-role="naming-input" placeholder="Es. pr_it_bed_static_brand_..._v1_hp">
+        <button class="primary-button" type="button" data-action="save-naming" data-id="${asset.id}">Salva</button>
+      </div>
+      <span class="resolved-tag">✓ Naming salvato</span>
+    </div>
+  `;
+}
+
+function handleHealthModalClick(event) {
+  const button = event.target.closest("[data-action]");
+  if (!button) return;
+  const action = button.dataset.action;
+
+  if (action === "merge-duplicate") {
+    mergeDuplicatePair(button.dataset.keep, button.dataset.merge);
+    renderHealthCheck();
+    render();
+    showToast("Duplicato unito: visual, note e performance sono stati conservati.");
+    return;
+  }
+
+  if (action === "ignore-duplicate") {
+    if (!ignoredDuplicatePairs.includes(button.dataset.pairKey)) {
+      ignoredDuplicatePairs.push(button.dataset.pairKey);
+      saveAssets();
+    }
+    renderHealthCheck();
+    render();
+    return;
+  }
+
+  if (action === "orphan-keep") {
+    const asset = assets.find((item) => item.id === button.dataset.id);
+    if (asset) {
+      asset.healthIgnored = { ...(asset.healthIgnored || {}), orphan: true };
+      saveAssets();
+    }
+    renderHealthCheck();
+    render();
+    return;
+  }
+
+  if (action === "orphan-archive") {
+    const asset = assets.find((item) => item.id === button.dataset.id);
+    if (asset) {
+      asset.archived = true;
+      saveAssets();
+      renderHealthCheck();
+      render();
+      showToast(`"${asset.assetName}" archiviato: resta nell'export, sparisce dalla tabella.`);
+    }
+    return;
+  }
+
+  if (action === "apply-campaign") {
+    const row = button.closest(".hc-row");
+    const select = row?.querySelector('[data-role="campaign-select"]');
+    const asset = assets.find((item) => item.id === button.dataset.id);
+    if (asset && select && select.value) {
+      asset.campaign = select.value;
+      saveAssets();
+      renderHealthCheck();
+      render();
+    }
+    return;
+  }
+
+  if (action === "save-naming") {
+    const row = button.closest(".hc-row");
+    const input = row?.querySelector('[data-role="naming-input"]');
+    const asset = assets.find((item) => item.id === button.dataset.id);
+    const value = String(input?.value || "").trim();
+    if (asset && value) {
+      asset.naming = value;
+      saveAssets();
+      renderHealthCheck();
+      render();
+      showToast("Naming salvato.");
+    }
+  }
+}
+
+function mergeDuplicatePair(keepId, mergeId) {
+  const keep = assets.find((item) => item.id === keepId);
+  const merge = assets.find((item) => item.id === mergeId);
+  if (!keep || !merge) return;
+
+  // Additive merge only: the kept asset never loses a visual, note or performance
+  // it already has — it only fills in what it's missing from the duplicate.
+  keep.visual = keep.visual || merge.visual;
+  keep.visualName = keep.visualName || merge.visualName;
+  keep.performance = keep.performance || merge.performance;
+  keep.naming = keep.naming || merge.naming;
+  if (merge.notes && merge.notes !== keep.notes) {
+    keep.notes = keep.notes ? `${keep.notes}\n${merge.notes}` : merge.notes;
+  }
+  keep.pipelineTracked = keep.pipelineTracked || merge.pipelineTracked;
+  if (merge.lastSeenImportAt && (!keep.lastSeenImportAt || merge.lastSeenImportAt > keep.lastSeenImportAt)) {
+    keep.lastSeenImportAt = merge.lastSeenImportAt;
+  }
+
+  assets = assets.filter((item) => item.id !== merge.id);
+  if (selectedId === merge.id) selectedId = keep.id;
+  if (modalAssetId === merge.id) modalAssetId = keep.id;
+  saveAssets();
+}
+
+// ==================== Data Health Check: Meta CSV modal ====================
+
+function bindMetaModal() {
+  els.metaModalClose.addEventListener("click", closeMetaModal);
+  els.metaModalBackdrop.addEventListener("click", (event) => {
+    if (event.target === els.metaModalBackdrop) closeMetaModal();
+  });
+  els.metaModalBody.addEventListener("click", handleMetaModalClick);
+}
+
+function openMetaModal() {
+  renderMetaCheck();
+  els.metaModalBackdrop.hidden = false;
+}
+
+function closeMetaModal() {
+  els.metaModalBackdrop.hidden = true;
+}
+
+function renderMetaCheck() {
+  const stats = lastMetaImportStats;
+  const pendingCount = unmatchedMetaRows.length;
+
+  els.metaModalBody.innerHTML = `
+    <div class="summary-strip cols-3">
+      <div class="summary-tile"><span>${stats ? stats.rows : "–"}</span><p>Righe nel CSV Meta</p></div>
+      <div class="summary-tile"><span>${stats ? stats.matched : "–"}</span><p>Collegate in automatico</p></div>
+      <div class="summary-tile alert"><span id="metaTotalCount">${pendingCount}</span><p>Da collegare manualmente</p></div>
+    </div>
+
+    <div class="hc-section">
+      <div class="hc-section-heading">
+        <div><h3>Performance Meta senza asset collegato</h3><p>Senza un collegamento, questa spesa e questi risultati non verrebbero mai associati a nessun visual</p></div>
+        <span class="count-pill">${pendingCount}</span>
+      </div>
+      <div class="hc-section-body">
+        ${pendingCount ? unmatchedMetaRows.map(metaRowTemplate).join("") : `<p class="hc-empty">Tutte le righe del CSV Meta sono collegate a un asset.</p>`}
+      </div>
+      <p class="hc-legend-note"><strong>Nota:</strong> "+ Crea nuovo asset" copre il caso di un asset in più rispetto al CSV (es. due statiche pubblicate a fronte di una sola riga in pipeline): crea l'asset con naming, formato e performance già collegati, e ricorda di riportarlo anche sul CSV/Google Sheet.</p>
+    </div>
+
+    <div class="hc-footer">
+      <p class="safety-note"><strong>Garanzia:</strong> nessuna spesa o risultato viene scartato in silenzio — o lo colleghi, o lo usi per creare un asset, o dichiari esplicitamente che non è vostro.</p>
+      <div class="hc-footer-actions">
+        <button class="ghost-button" type="button" id="metaCloseBtn2">Chiudi e rivedi più tardi</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById("metaCloseBtn2").addEventListener("click", closeMetaModal);
+}
+
+function metaRowTemplate(row) {
+  const perf = row.performance;
+  const options = activeAssets()
+    .slice()
+    .sort((a, b) => a.assetName.localeCompare(b.assetName))
+    .map((asset) => `<option value="${asset.id}">${escapeHtml(asset.assetName)} — ${escapeHtml(asset.campaign || "-")}</option>`)
+    .join("");
+  return `
+    <div class="hc-row" data-ad-name="${escapeAttr(row.adName)}">
+      <div class="info">
+        <strong class="ad-name">${escapeHtml(row.adName)}</strong>
+        <small>Nessun asset con questo naming nella pipeline attuale</small>
+        <div class="metrics">
+          <span>Spend <strong>${formatMetric(perf.spend, "currency")}</strong></span>
+          <span>CPR <strong>${formatMetric(perf.cpr, "currency")}</strong></span>
+          <span>Risultati <strong>${perf.results ?? "-"}</strong></span>
+        </div>
+      </div>
+      <div class="row-actions">
+        <select data-role="asset-select">
+          <option value="">Collega manualmente all'asset...</option>
+          ${options}
+        </select>
+        <button class="primary-button" type="button" data-action="meta-link" data-ad-name="${escapeAttr(row.adName)}">Collega</button>
+        <button class="ghost-button" type="button" data-action="meta-create" data-ad-name="${escapeAttr(row.adName)}">+ Crea nuovo asset</button>
+        <button class="small-link" type="button" data-action="meta-ignore" data-ad-name="${escapeAttr(row.adName)}">Ignora</button>
+      </div>
+      <span class="resolved-tag"></span>
+    </div>
+  `;
+}
+
+function handleMetaModalClick(event) {
+  const button = event.target.closest("[data-action]");
+  if (!button) return;
+  const action = button.dataset.action;
+  const adName = button.dataset.adName;
+  const rowIndex = unmatchedMetaRows.findIndex((row) => row.adName === adName);
+  if (rowIndex === -1) return;
+  const row = unmatchedMetaRows[rowIndex];
+
+  if (action === "meta-link") {
+    const rowEl = button.closest(".hc-row");
+    const select = rowEl?.querySelector('[data-role="asset-select"]');
+    const asset = assets.find((item) => item.id === select?.value);
+    if (!asset) {
+      showToast("Seleziona prima un asset dalla lista.");
+      return;
+    }
+    asset.performance = row.performance;
+    // Teach the app this ad name maps to this asset by filling in its naming if it was
+    // blank — otherwise the exact same ad name would resurface as unmatched on every
+    // future Meta import, forcing her to re-link it by hand each time.
+    if (!asset.naming) {
+      asset.naming = row.adName;
+    }
+    unmatchedMetaRows.splice(rowIndex, 1);
+    saveAssets();
+    renderMetaCheck();
+    render();
+    showToast(`Performance collegata a "${asset.assetName}".`);
+    return;
+  }
+
+  if (action === "meta-create") {
+    const created = createAssetFromMetaRow(row);
+    unmatchedMetaRows.splice(rowIndex, 1);
+    saveAssets();
+    populateFilters();
+    renderMetaCheck();
+    render();
+    showToast(`"${created.assetName}" creato dalla riga Meta — ricordati di aggiungerlo anche al CSV/Google Sheet.`);
+    return;
+  }
+
+  if (action === "meta-ignore") {
+    if (!ignoredMetaAdNames.includes(row.normalizedAdName)) {
+      ignoredMetaAdNames.push(row.normalizedAdName);
+    }
+    unmatchedMetaRows.splice(rowIndex, 1);
+    saveAssets();
+    renderMetaCheck();
+    render();
+  }
+}
+
+function humanizeAdName(adName) {
+  // Raw ad names are unbroken machine slugs (no spaces); used verbatim as an
+  // assetName they overflow every card/table layout that displays it. Spacing
+  // them out keeps the exact naming intact (still stored separately) while giving
+  // the table/cards something that actually wraps.
+  return String(adName || "").replace(/_/g, " ").trim() || "Asset da Meta CSV";
+}
+
+function createAssetFromMetaRow(row) {
+  const asset = {
+    id: makeAssetId(),
+    campaign: "",
+    goLive: "",
+    deadline: "",
+    country: "",
+    priority: "High",
+    campaignType: "",
+    assetName: humanizeAdName(row.adName),
+    format: normalizeFormat(row.adName),
+    creativeType: normalizeCreativeType(row.adName),
+    productCategory: "",
+    productCluster: "",
+    hook: "",
+    cta: "",
+    prospectingMessage: "",
+    remarketingMessage: "",
+    funnel: "pr_",
+    landing: "hp",
+    naming: row.adName,
+    assignee: "Federica",
+    status: "Draft",
+    rationale: "",
+    notes: "",
+    performance: row.performance,
+    visual: "",
+    visualName: "",
+    isNew: true,
+    archived: false,
+    pipelineTracked: false,
+    lastSeenImportAt: null,
+    healthIgnored: {}
+  };
+  assets.unshift(asset);
+  selectedId = asset.id;
+  return asset;
+}
+
+function updateHealthBadges() {
+  const healthCount = countOpenAnomalies();
+  els.healthBadge.textContent = healthCount;
+  els.healthBadge.style.display = healthCount ? "grid" : "none";
+
+  const metaCount = unmatchedMetaRows.length;
+  els.metaBadge.textContent = metaCount;
+  els.metaBadge.style.display = metaCount ? "grid" : "none";
 }
 
 init();
