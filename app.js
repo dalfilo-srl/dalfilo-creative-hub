@@ -77,6 +77,9 @@ let ignoredMetaAdNames = appState.ignoredMetaAdNames;
 let unmatchedMetaRows = appState.unmatchedMetaRows;
 let lastPipelineImportStats = appState.lastPipelineImportStats;
 let lastMetaImportStats = appState.lastMetaImportStats;
+// Tracks the "savedAt" this page last saw written to localStorage — used by saveAssets()
+// to detect when another tab/session has saved more recently than this one (see there).
+let lastKnownSavedAt = appState.savedAt;
 
 const els = {
   rows: document.getElementById("assetRows"),
@@ -190,9 +193,30 @@ function mergePreservedAssetState(targetAssets, previousAssets) {
 }
 
 function saveAssets() {
-  localStorage.setItem(storageKey, JSON.stringify({
+  // Guard against silently clobbering newer data: if another tab/window (or a later
+  // session left open in the background) has saved more recently than what THIS page
+  // last saw, blindly overwriting localStorage here would erase that newer work —
+  // exactly the kind of "visuals disappeared" report this guard exists to prevent.
+  const currentRaw = localStorage.getItem(storageKey);
+  if (currentRaw) {
+    try {
+      const currentParsed = JSON.parse(currentRaw);
+      if (currentParsed.savedAt && lastKnownSavedAt && currentParsed.savedAt !== lastKnownSavedAt) {
+        window.alert(
+          "Questa pagina non ha gli ultimi dati salvati: probabilmente hai un'altra scheda o finestra di Creative Hub aperta altrove, oppure hai salvato di recente da un'altra sessione.\n\n" +
+          "Per non rischiare di cancellare quei dati più recenti, questo salvataggio è stato bloccato. Ricarica la pagina (F5) e riprova qui — se avevi appena fatto una modifica in questa scheda, rifalla dopo il ricaricamento."
+        );
+        return false;
+      }
+    } catch {
+      // Unparsable existing value — fall through and attempt the save anyway.
+    }
+  }
+
+  const savedAt = new Date().toISOString();
+  const payload = {
     assets,
-    savedAt: new Date().toISOString(),
+    savedAt,
     lastPipelineImportAt,
     lastImportCampaigns,
     ignoredDuplicatePairs,
@@ -200,11 +224,27 @@ function saveAssets() {
     unmatchedMetaRows,
     lastPipelineImportStats,
     lastMetaImportStats
-  }));
+  };
+
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(payload));
+    lastKnownSavedAt = savedAt;
+    return true;
+  } catch (error) {
+    // Most likely a full localStorage quota (lots of uploaded visuals add up fast as
+    // base64 text). This save did NOT go through — say so loudly instead of losing
+    // the change silently.
+    window.alert(
+      "Impossibile salvare: lo spazio di archiviazione di questa pagina nel browser è pieno (probabilmente troppi visual caricati).\n\n" +
+      "Questa modifica NON è stata salvata. Esporta subito un backup con il pulsante \"JSON\" e poi valuta di liberare spazio (ad es. sostituendo qualche visual con una versione più leggera)."
+    );
+    return false;
+  }
 }
 
 function loadAppState() {
   const defaults = {
+    savedAt: null,
     lastPipelineImportAt: null,
     lastImportCampaigns: [],
     ignoredDuplicatePairs: [],
@@ -218,6 +258,7 @@ function loadAppState() {
   try {
     const parsed = JSON.parse(saved);
     return {
+      savedAt: parsed.savedAt || defaults.savedAt,
       lastPipelineImportAt: parsed.lastPipelineImportAt || defaults.lastPipelineImportAt,
       lastImportCampaigns: Array.isArray(parsed.lastImportCampaigns) ? parsed.lastImportCampaigns : defaults.lastImportCampaigns,
       ignoredDuplicatePairs: Array.isArray(parsed.ignoredDuplicatePairs) ? parsed.ignoredDuplicatePairs : defaults.ignoredDuplicatePairs,
@@ -284,11 +325,13 @@ function bindActions() {
     unmatchedMetaRows = [];
     lastPipelineImportStats = null;
     lastMetaImportStats = null;
-    saveAssets();
+    const saved = saveAssets();
     populateFilters();
     closeAssetModal();
     render();
-    showToast("Pipeline ripristinata.");
+    if (saved) {
+      showToast("Pipeline ripristinata.");
+    }
   });
 
   document.getElementById("importPipelineCsv").addEventListener("click", () => els.pipelineCsvInput.click());
@@ -623,10 +666,12 @@ function deleteAsset(asset) {
     closeAssetModal();
   }
 
-  saveAssets();
+  const saved = saveAssets();
   populateFilters();
   render();
-  showToast(`"${label}" eliminato.`);
+  if (saved) {
+    showToast(`"${label}" eliminato.`);
+  }
 }
 
 function openNewAssetDrawer(prefill = {}) {
@@ -703,13 +748,15 @@ function handleAssetSubmit(event) {
       assets.unshift(asset);
     }
     selectedId = asset.id;
-    saveAssets();
+    const saved = saveAssets();
     populateFilters();
     closeAssetDrawer();
     currentView = "production";
     showProductionView();
     render();
-    showToast(existingAsset ? "Asset aggiornato." : "Asset creato in pipeline.");
+    if (saved) {
+      showToast(existingAsset ? "Asset aggiornato." : "Asset creato in pipeline.");
+    }
   };
 
   if (file && file.size) {
@@ -867,9 +914,11 @@ function handleVisualUpload(event, asset) {
   compressImage(file).then((dataUrl) => {
     asset.visual = dataUrl || "";
     asset.visualName = file.name;
-    saveAssets();
+    const saved = saveAssets();
     render();
-    showToast("Visual collegato alla riga.");
+    if (saved) {
+      showToast("Visual collegato alla riga.");
+    }
   });
 }
 
@@ -1092,13 +1141,15 @@ function handlePipelineCsvImport(event) {
     lastPipelineImportAt = importTimestamp;
     lastImportCampaigns = campaignsSeen;
     lastPipelineImportStats = { rows: rows.length, created: result.created, updated: result.updated };
-    saveAssets();
+    const saved = saveAssets();
     populateFilters();
     render();
-    const anomalies = countOpenAnomalies();
-    showToast(`${result.created} creati · ${result.updated} aggiornati dal tab ADV Pipeline${anomalies ? ` · ${anomalies} anomalie rilevate` : ""}.`);
-    if (anomalies > 0) {
-      setTimeout(openHealthModal, 500);
+    if (saved) {
+      const anomalies = countOpenAnomalies();
+      showToast(`${result.created} creati · ${result.updated} aggiornati dal tab ADV Pipeline${anomalies ? ` · ${anomalies} anomalie rilevate` : ""}.`);
+      if (anomalies > 0) {
+        setTimeout(openHealthModal, 500);
+      }
     }
     els.pipelineCsvInput.value = "";
   };
@@ -1245,11 +1296,13 @@ function handleMetaCsvImport(event) {
     const rows = parseCsv(String(reader.result || ""));
     const result = applyMetaRows(rows, file.name);
     lastMetaImportStats = { rows: rows.length, matched: result.matched, unmatched: result.unmatched };
-    saveAssets();
+    const saved = saveAssets();
     render();
-    showToast(`${result.matched} asset matchati da ${file.name}${result.unmatched ? ` · ${result.unmatched} righe senza corrispondenza` : ""}.`);
-    if (result.unmatched > 0) {
-      setTimeout(openMetaModal, 500);
+    if (saved) {
+      showToast(`${result.matched} asset matchati da ${file.name}${result.unmatched ? ` · ${result.unmatched} righe senza corrispondenza` : ""}.`);
+      if (result.unmatched > 0) {
+        setTimeout(openMetaModal, 500);
+      }
     }
     els.metaCsvInput.value = "";
   };
@@ -1796,10 +1849,14 @@ function handleHealthModalClick(event) {
   const action = button.dataset.action;
 
   if (action === "merge-duplicate") {
-    mergeDuplicatePair(button.dataset.keep, button.dataset.merge);
+    const result = mergeDuplicatePair(button.dataset.keep, button.dataset.merge);
     renderHealthCheck();
     render();
-    showToast("Duplicato unito: visual, note e performance sono stati conservati.");
+    if (result.merged) {
+      showToast("Duplicato unito: visual, note e performance sono stati conservati.");
+    } else if (result.reason === "conflicting-visuals") {
+      window.alert("Questi due asset hanno entrambi un visual diverso: non li unisco automaticamente per non rischiare di perderne uno. Controlla i due asset e rimuovi manualmente il visual sbagliato prima di riprovare, oppure usa \"Non sono duplicati, ignora\" se in realtà sono due asset distinti.");
+    }
     return;
   }
 
@@ -1828,10 +1885,12 @@ function handleHealthModalClick(event) {
     const asset = assets.find((item) => item.id === button.dataset.id);
     if (asset) {
       asset.archived = true;
-      saveAssets();
+      const saved = saveAssets();
       renderHealthCheck();
       render();
-      showToast(`"${asset.assetName}" archiviato: resta nell'export, sparisce dalla tabella.`);
+      if (saved) {
+        showToast(`"${asset.assetName}" archiviato: resta nell'export, sparisce dalla tabella.`);
+      }
     }
     return;
   }
@@ -1856,10 +1915,12 @@ function handleHealthModalClick(event) {
     const value = String(input?.value || "").trim();
     if (asset && value) {
       asset.naming = value;
-      saveAssets();
+      const saved = saveAssets();
       renderHealthCheck();
       render();
-      showToast("Naming salvato.");
+      if (saved) {
+        showToast("Naming salvato.");
+      }
     }
   }
 }
@@ -1867,7 +1928,14 @@ function handleHealthModalClick(event) {
 function mergeDuplicatePair(keepId, mergeId) {
   const keep = assets.find((item) => item.id === keepId);
   const merge = assets.find((item) => item.id === mergeId);
-  if (!keep || !merge) return;
+  if (!keep || !merge) return { merged: false, reason: "not-found" };
+
+  // Never silently drop a visual: if BOTH sides already have their own (different)
+  // visual, merging one away would violate the "a visual is never deleted" guarantee.
+  // Refuse the merge rather than guess which photo to keep.
+  if (keep.visual && merge.visual && keep.visual !== merge.visual) {
+    return { merged: false, reason: "conflicting-visuals" };
+  }
 
   // Additive merge only: the kept asset never loses a visual, note or performance
   // it already has — it only fills in what it's missing from the duplicate.
@@ -1886,7 +1954,8 @@ function mergeDuplicatePair(keepId, mergeId) {
   assets = assets.filter((item) => item.id !== merge.id);
   if (selectedId === merge.id) selectedId = keep.id;
   if (modalAssetId === merge.id) modalAssetId = keep.id;
-  saveAssets();
+  const saved = saveAssets();
+  return { merged: saved, reason: saved ? null : "save-failed" };
 }
 
 // ==================== Data Health Check: Meta CSV modal ====================
@@ -1998,21 +2067,25 @@ function handleMetaModalClick(event) {
       asset.naming = row.adName;
     }
     unmatchedMetaRows.splice(rowIndex, 1);
-    saveAssets();
+    const savedLink = saveAssets();
     renderMetaCheck();
     render();
-    showToast(`Performance collegata a "${asset.assetName}".`);
+    if (savedLink) {
+      showToast(`Performance collegata a "${asset.assetName}".`);
+    }
     return;
   }
 
   if (action === "meta-create") {
     const created = createAssetFromMetaRow(row);
     unmatchedMetaRows.splice(rowIndex, 1);
-    saveAssets();
+    const savedCreate = saveAssets();
     populateFilters();
     renderMetaCheck();
     render();
-    showToast(`"${created.assetName}" creato dalla riga Meta — ricordati di aggiungerlo anche al CSV/Google Sheet.`);
+    if (savedCreate) {
+      showToast(`"${created.assetName}" creato dalla riga Meta — ricordati di aggiungerlo anche al CSV/Google Sheet.`);
+    }
     return;
   }
 
