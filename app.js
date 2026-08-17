@@ -412,6 +412,28 @@ function render() {
   if (currentView === "visuals") renderVisualLibrary();
   if (modalAssetId) renderModalContent();
   updateHealthBadges();
+  renderStorageUsage();
+}
+
+// Most browsers give each site around 5-10 MB of localStorage; we assume the more
+// conservative 5 MB so the warning triggers before anyone actually hits a hard limit.
+const ASSUMED_STORAGE_QUOTA_BYTES = 5 * 1024 * 1024;
+
+function getStorageUsageBytes() {
+  const raw = localStorage.getItem(storageKey) || "";
+  // Browsers store strings as UTF-16 (2 bytes/char) when counting against storage quotas.
+  return raw.length * 2;
+}
+
+function renderStorageUsage() {
+  const el = document.getElementById("storageUsageLine");
+  if (!el) return;
+  const bytes = getStorageUsageBytes();
+  const mb = bytes / (1024 * 1024);
+  const percent = Math.min(100, Math.round((bytes / ASSUMED_STORAGE_QUOTA_BYTES) * 100));
+  el.textContent = `Spazio usato: ~${mb.toFixed(1)} MB (~${percent}% di un limite tipico di 5 MB)`;
+  el.classList.toggle("is-warning", percent >= 70 && percent < 90);
+  el.classList.toggle("is-danger", percent >= 90);
 }
 
 function renderKpis() {
