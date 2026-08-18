@@ -2415,13 +2415,22 @@ function startFirestoreListener() {
     async (snapshot) => {
       // Empty collection on first load: populate it from this browser's local data
       // (migration) or from the built-in seed.
-      if (!firstSnapshotSeen && snapshot.empty && !seedInFlight) {
+      //
+      // fromCache must be checked too: on a browser with no local Firestore cache
+      // (a fresh profile, or incognito) the very first snapshot arrives empty and
+      // cache-only, before the server has answered. Seeding on that snapshot writes
+      // the seed set on top of a collection that already has data — which is exactly
+      // how the duplicate asset-1..50 / asset-51..125 situation was produced.
+      if (!firstSnapshotSeen && snapshot.empty && !snapshot.metadata.fromCache && !seedInFlight) {
         seedInFlight = true;
         try { await runFirstTimeSeed(); }
         finally { seedInFlight = false; }
         return; // the seed writes trigger a fresh snapshot
       }
-      firstSnapshotSeen = true;
+      // Only a server-backed snapshot counts as "we now know what the collection
+      // holds". Otherwise a cache-only first snapshot would permanently disable the
+      // seeding path on a genuinely empty collection.
+      if (!snapshot.metadata.fromCache) firstSnapshotSeen = true;
 
       const incoming = [];
       snapshot.forEach((docSnap) => incoming.push(normalizeAssetDefaults(docSnap.data())));
