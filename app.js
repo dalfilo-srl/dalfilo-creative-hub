@@ -63,14 +63,26 @@ const seedAssets = Array.isArray(window.DALFILO_SEED_ASSETS)
 
 const storageKey = "dalfilo-creative-hub-v3";
 const legacyStorageKeys = ["dalfilo-creative-hub-v2", "dalfilo-creative-hub-v1"];
-const notesStorageKey = "dalfilo-creative-hub-notes";
 
 // ---- Firebase wiring (iterazione 1: auth + assets + visual) ----
 const FS_COLLECTION = "assets";
+// Shared, team-wide state. Split across two documents on purpose: the notes doc is
+// rewritten on (debounced) keystrokes, so it must not drag the whole import state
+// along with it.
+const FS_APP_COLLECTION = "app";
+const FS_STATE_DOC = "state";
+const FS_NOTES_DOC = "notes";
 const STORAGE_PREFIX = "visuals";
 const ALLOWED_DOMAIN = "dalfilo.com";
 let currentUser = null;
 let firestoreUnsub = null;
+let stateUnsub = null;
+let notesUnsub = null;
+let stateFlushTimer = null;
+let notesFlushTimer = null;
+// Set while applying a server snapshot, so the resulting DOM updates don't echo
+// straight back to Firestore as a fresh write.
+let applyingRemoteState = false;
 let firstSnapshotSeen = false;
 let seedInFlight = false;
 let flushTimer = null;
@@ -225,25 +237,35 @@ function saveAssets() {
   return true;
 }
 
-// App-level state (import history, ignored duplicates, unmatched Meta rows) stays
-// in localStorage for now — it moves to Firestore in iterazione 2.
+// Import history, ignored duplicates and unmatched Meta rows are team-wide: a
+// decision taken by one person must not have to be repeated by everyone else.
 function saveAppStateLocally() {
+  if (applyingRemoteState) return;
+  clearTimeout(stateFlushTimer);
+  stateFlushTimer = setTimeout(flushAppStateToFirestore, 400);
+}
+
+async function flushAppStateToFirestore() {
+  const fb = window.__firebase;
+  if (!fb || !currentUser) return;
   const savedAt = new Date().toISOString();
   const payload = {
     savedAt,
-    lastPipelineImportAt,
-    lastImportCampaigns,
-    ignoredDuplicatePairs,
-    ignoredMetaAdNames,
-    unmatchedMetaRows,
-    lastPipelineImportStats,
-    lastMetaImportStats
+    lastPipelineImportAt: lastPipelineImportAt || null,
+    lastImportCampaigns: lastImportCampaigns || [],
+    ignoredDuplicatePairs: ignoredDuplicatePairs || [],
+    ignoredMetaAdNames: ignoredMetaAdNames || [],
+    unmatchedMetaRows: unmatchedMetaRows || [],
+    lastPipelineImportStats: lastPipelineImportStats || null,
+    lastMetaImportStats: lastMetaImportStats || null
   };
   try {
-    localStorage.setItem(storageKey, JSON.stringify(payload));
+    await fb.setDoc(fb.doc(fb.db, FS_APP_COLLECTION, FS_STATE_DOC), payload);
     lastKnownSavedAt = savedAt;
   } catch (error) {
-    console.warn("[appState] local save failed", error);
+    console.error("[firestore] app state save failed", error);
+    setSyncBadge("error", "Errore salvataggio stato");
+    showToast("Errore salvataggio stato: " + (error.code || error.message));
   }
 }
 
@@ -313,8 +335,11 @@ function stripLocalOnlyFields(asset) {
   return copy;
 }
 
+// Runs at script load, before authentication. The real values arrive from the
+// Firestore listener once the user is signed in; these are just the placeholders
+// the app renders with in the meantime.
 function loadAppState() {
-  const defaults = {
+  return {
     savedAt: null,
     lastPipelineImportAt: null,
     lastImportCampaigns: [],
@@ -324,31 +349,50 @@ function loadAppState() {
     lastPipelineImportStats: null,
     lastMetaImportStats: null
   };
-  const saved = localStorage.getItem(storageKey);
-  if (!saved) return defaults;
+}
+
+// Applies a snapshot of the shared state document to the module-level variables
+// the rest of the app already reads from.
+function applyRemoteAppState(data) {
+  applyingRemoteState = true;
   try {
-    const parsed = JSON.parse(saved);
-    return {
-      savedAt: parsed.savedAt || defaults.savedAt,
-      lastPipelineImportAt: parsed.lastPipelineImportAt || defaults.lastPipelineImportAt,
-      lastImportCampaigns: Array.isArray(parsed.lastImportCampaigns) ? parsed.lastImportCampaigns : defaults.lastImportCampaigns,
-      ignoredDuplicatePairs: Array.isArray(parsed.ignoredDuplicatePairs) ? parsed.ignoredDuplicatePairs : defaults.ignoredDuplicatePairs,
-      ignoredMetaAdNames: Array.isArray(parsed.ignoredMetaAdNames) ? parsed.ignoredMetaAdNames : defaults.ignoredMetaAdNames,
-      unmatchedMetaRows: Array.isArray(parsed.unmatchedMetaRows) ? parsed.unmatchedMetaRows : defaults.unmatchedMetaRows,
-      lastPipelineImportStats: parsed.lastPipelineImportStats || defaults.lastPipelineImportStats,
-      lastMetaImportStats: parsed.lastMetaImportStats || defaults.lastMetaImportStats
-    };
-  } catch {
-    return defaults;
+    lastPipelineImportAt = data.lastPipelineImportAt || null;
+    lastImportCampaigns = Array.isArray(data.lastImportCampaigns) ? data.lastImportCampaigns : [];
+    ignoredDuplicatePairs = Array.isArray(data.ignoredDuplicatePairs) ? data.ignoredDuplicatePairs : [];
+    ignoredMetaAdNames = Array.isArray(data.ignoredMetaAdNames) ? data.ignoredMetaAdNames : [];
+    unmatchedMetaRows = Array.isArray(data.unmatchedMetaRows) ? data.unmatchedMetaRows : [];
+    lastPipelineImportStats = data.lastPipelineImportStats || null;
+    lastMetaImportStats = data.lastMetaImportStats || null;
+    lastKnownSavedAt = data.savedAt || null;
+  } finally {
+    applyingRemoteState = false;
   }
 }
 
 function loadTeamNotes() {
-  return localStorage.getItem(notesStorageKey) || "";
+  return els.teamNotes?.value || "";
 }
 
+// Team notes are a shared scratchpad, so they go to their own document.
 function saveTeamNotes(value) {
-  localStorage.setItem(notesStorageKey, value);
+  if (applyingRemoteState) return;
+  clearTimeout(notesFlushTimer);
+  notesFlushTimer = setTimeout(() => flushTeamNotesToFirestore(value), 600);
+}
+
+async function flushTeamNotesToFirestore(value) {
+  const fb = window.__firebase;
+  if (!fb || !currentUser) return;
+  try {
+    await fb.setDoc(fb.doc(fb.db, FS_APP_COLLECTION, FS_NOTES_DOC), {
+      text: value,
+      updatedAt: new Date().toISOString(),
+      updatedBy: currentUser.email || ""
+    });
+  } catch (error) {
+    console.error("[firestore] notes save failed", error);
+    showToast("Errore salvataggio note: " + (error.code || error.message));
+  }
 }
 
 // init() runs after a successful login. The guard keeps a logout/login cycle from
@@ -363,7 +407,8 @@ function init() {
   bindHealthModal();
   bindMetaModal();
   populateFilters();
-  els.teamNotes.value = loadTeamNotes();
+  // The textarea starts empty and is filled by the notes listener once the shared
+  // document arrives.
   els.teamNotes.addEventListener("input", (event) => saveTeamNotes(event.target.value));
   [els.librarySearch, els.libraryFormatFilter, els.librarySort].forEach((control) => {
     control.addEventListener("input", renderVisualLibrary);
@@ -404,6 +449,8 @@ function bindActions() {
     unmatchedMetaRows = [];
     lastPipelineImportStats = null;
     lastMetaImportStats = null;
+    els.teamNotes.value = "";
+    flushTeamNotesToFirestore("");
     const saved = saveAssets();
     populateFilters();
     closeAssetModal();
@@ -494,25 +541,14 @@ function render() {
   renderStorageUsage();
 }
 
-// Most browsers give each site around 5-10 MB of localStorage; we assume the more
-// conservative 5 MB so the warning triggers before anyone actually hits a hard limit.
-const ASSUMED_STORAGE_QUOTA_BYTES = 5 * 1024 * 1024;
-
-function getStorageUsageBytes() {
-  const raw = localStorage.getItem(storageKey) || "";
-  // Browsers store strings as UTF-16 (2 bytes/char) when counting against storage quotas.
-  return raw.length * 2;
-}
-
+// The old gauge measured localStorage, which is empty now that assets live in
+// Firestore and visuals in Storage. It reports what is actually stored instead.
 function renderStorageUsage() {
   const el = document.getElementById("storageUsageLine");
   if (!el) return;
-  const bytes = getStorageUsageBytes();
-  const mb = bytes / (1024 * 1024);
-  const percent = Math.min(100, Math.round((bytes / ASSUMED_STORAGE_QUOTA_BYTES) * 100));
-  el.textContent = `Spazio usato: ~${mb.toFixed(1)} MB (~${percent}% di un limite tipico di 5 MB)`;
-  el.classList.toggle("is-warning", percent >= 70 && percent < 90);
-  el.classList.toggle("is-danger", percent >= 90);
+  const withVisual = assets.filter((asset) => asset.visual).length;
+  el.textContent = `${assets.length} asset · ${withVisual} visual su Firebase`;
+  el.classList.remove("is-warning", "is-danger");
 }
 
 function renderKpis() {
@@ -2403,6 +2439,40 @@ async function doLogout() {
 
 function stopFirestoreListener() {
   if (firestoreUnsub) { firestoreUnsub(); firestoreUnsub = null; }
+  if (stateUnsub) { stateUnsub(); stateUnsub = null; }
+  if (notesUnsub) { notesUnsub(); notesUnsub = null; }
+}
+
+function startSharedStateListeners() {
+  const fb = window.__firebase;
+  if (!fb) return;
+
+  stateUnsub = fb.onSnapshot(
+    fb.doc(fb.db, FS_APP_COLLECTION, FS_STATE_DOC),
+    (snapshot) => {
+      if (!snapshot.exists()) return;
+      applyRemoteAppState(snapshot.data() || {});
+      updateHealthBadges();
+      render();
+    },
+    (error) => console.error("[firestore] state listener error", error)
+  );
+
+  notesUnsub = fb.onSnapshot(
+    fb.doc(fb.db, FS_APP_COLLECTION, FS_NOTES_DOC),
+    (snapshot) => {
+      if (!snapshot.exists()) return;
+      const incoming = snapshot.data()?.text || "";
+      // Don't yank the textarea out from under someone who is mid-sentence: their
+      // own debounced write will land shortly and everyone converges on it.
+      if (document.activeElement === els.teamNotes) return;
+      if (els.teamNotes.value === incoming) return;
+      applyingRemoteState = true;
+      try { els.teamNotes.value = incoming; }
+      finally { applyingRemoteState = false; }
+    },
+    (error) => console.error("[firestore] notes listener error", error)
+  );
 }
 
 function startFirestoreListener() {
@@ -2525,6 +2595,7 @@ function bootFirebaseAuth() {
       selectedId = null;
       firstSnapshotSeen = false;
       lastPushedById = new Map();
+      if (els.teamNotes) els.teamNotes.value = "";
       showAuthScreen();
       return;
     }
@@ -2546,6 +2617,7 @@ function bootFirebaseAuth() {
     hideAuthScreen();
     init();
     startFirestoreListener();
+    startSharedStateListeners();
   });
 }
 
