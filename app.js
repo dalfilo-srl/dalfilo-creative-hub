@@ -64,8 +64,23 @@ const seedAssets = Array.isArray(window.DALFILO_SEED_ASSETS)
 const storageKey = "dalfilo-creative-hub-v3";
 const legacyStorageKeys = ["dalfilo-creative-hub-v2", "dalfilo-creative-hub-v1"];
 const notesStorageKey = "dalfilo-creative-hub-notes";
-let assets = loadAssets();
-let selectedId = assets[0]?.id || null;
+
+// ---- Firebase wiring (iterazione 1: auth + assets + visual) ----
+const FS_COLLECTION = "assets";
+const STORAGE_PREFIX = "visuals";
+const ALLOWED_DOMAIN = "dalfilo.com";
+let currentUser = null;
+let firestoreUnsub = null;
+let firstSnapshotSeen = false;
+let seedInFlight = false;
+let flushTimer = null;
+// Snapshot of what we last pushed to Firestore, keyed by asset id. Used to send
+// only the documents that actually changed instead of rewriting the collection.
+let lastPushedById = new Map();
+
+// Assets start empty and are filled by the Firestore listener once the user logs in.
+let assets = [];
+let selectedId = null;
 let modalAssetId = null;
 let currentView = "production";
 let editingAssetId = null;
@@ -117,7 +132,9 @@ const els = {
 
 let namingTouched = false;
 
-function loadAssets() {
+// Reads whatever this browser still has in localStorage. Only used once, to seed
+// Firestore the first time the collection is empty (see runFirstTimeSeed).
+function loadLocalAssets() {
   const savedAssets = parseSavedAssets(storageKey);
   if (savedAssets) return savedAssets.map(normalizeAssetDefaults);
 
@@ -167,6 +184,8 @@ function normalizeAssetDefaults(asset) {
     performance: asset.performance || null,
     visual: asset.visual || "",
     visualName: asset.visualName || "",
+    // Path of the file inside Firebase Storage, so it can be replaced/deleted later.
+    visualPath: asset.visualPath || "",
     isNew: asset.isNew || false,
     archived: asset.archived || false,
     // true only once an asset has originated from, or been matched by, a CSV pipeline
@@ -192,30 +211,25 @@ function mergePreservedAssetState(targetAssets, previousAssets) {
   });
 }
 
+// Assets now live in Firestore. This stays synchronous and keeps returning a
+// boolean so the ~18 existing call sites don't need to change: the write is
+// scheduled and flushed in the background, with errors surfaced via the sync
+// badge and a toast rather than a blocking alert.
+//
+// The multi-tab clobbering guard that used to live here is gone on purpose:
+// with a realtime listener every tab converges on the same server state, so
+// there is no "stale tab overwrites newer data" scenario left to defend against.
 function saveAssets() {
-  // Guard against silently clobbering newer data: if another tab/window (or a later
-  // session left open in the background) has saved more recently than what THIS page
-  // last saw, blindly overwriting localStorage here would erase that newer work —
-  // exactly the kind of "visuals disappeared" report this guard exists to prevent.
-  const currentRaw = localStorage.getItem(storageKey);
-  if (currentRaw) {
-    try {
-      const currentParsed = JSON.parse(currentRaw);
-      if (currentParsed.savedAt && lastKnownSavedAt && currentParsed.savedAt !== lastKnownSavedAt) {
-        window.alert(
-          "Questa pagina non ha gli ultimi dati salvati: probabilmente hai un'altra scheda o finestra di Creative Hub aperta altrove, oppure hai salvato di recente da un'altra sessione.\n\n" +
-          "Per non rischiare di cancellare quei dati più recenti, questo salvataggio è stato bloccato. Ricarica la pagina (F5) e riprova qui — se avevi appena fatto una modifica in questa scheda, rifalla dopo il ricaricamento."
-        );
-        return false;
-      }
-    } catch {
-      // Unparsable existing value — fall through and attempt the save anyway.
-    }
-  }
+  saveAppStateLocally();
+  scheduleFirestoreFlush();
+  return true;
+}
 
+// App-level state (import history, ignored duplicates, unmatched Meta rows) stays
+// in localStorage for now — it moves to Firestore in iterazione 2.
+function saveAppStateLocally() {
   const savedAt = new Date().toISOString();
   const payload = {
-    assets,
     savedAt,
     lastPipelineImportAt,
     lastImportCampaigns,
@@ -225,21 +239,78 @@ function saveAssets() {
     lastPipelineImportStats,
     lastMetaImportStats
   };
-
   try {
     localStorage.setItem(storageKey, JSON.stringify(payload));
     lastKnownSavedAt = savedAt;
-    return true;
   } catch (error) {
-    // Most likely a full localStorage quota (lots of uploaded visuals add up fast as
-    // base64 text). This save did NOT go through — say so loudly instead of losing
-    // the change silently.
-    window.alert(
-      "Impossibile salvare: lo spazio di archiviazione di questa pagina nel browser è pieno (probabilmente troppi visual caricati).\n\n" +
-      "Questa modifica NON è stata salvata. Esporta subito un backup con il pulsante \"JSON\" e poi valuta di liberare spazio (ad es. sostituendo qualche visual con una versione più leggera)."
-    );
-    return false;
+    console.warn("[appState] local save failed", error);
   }
+}
+
+function scheduleFirestoreFlush() {
+  setSyncBadge("syncing", "Salvataggio…");
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(flushAssetsToFirestore, 400);
+}
+
+// Writes only the assets that changed since the last successful push, and removes
+// documents for assets that no longer exist locally.
+async function flushAssetsToFirestore() {
+  const fb = window.__firebase;
+  if (!fb || !currentUser) return;
+
+  const currentById = new Map(assets.map((asset) => [asset.id, asset]));
+  const changed = [];
+  currentById.forEach((asset, id) => {
+    const previous = lastPushedById.get(id);
+    const serialized = JSON.stringify(stripLocalOnlyFields(asset));
+    if (previous !== serialized) changed.push({ asset, serialized });
+  });
+  const removedIds = [];
+  lastPushedById.forEach((_value, id) => {
+    if (!currentById.has(id)) removedIds.push(id);
+  });
+
+  if (!changed.length && !removedIds.length) {
+    setSyncBadge("online", "Sincronizzato");
+    return;
+  }
+
+  try {
+    let batch = fb.writeBatch(fb.db);
+    let ops = 0;
+    for (const { asset } of changed) {
+      batch.set(fb.doc(fb.db, FS_COLLECTION, asset.id), stripLocalOnlyFields(asset));
+      ops++;
+      if (ops % 400 === 0) { await batch.commit(); batch = fb.writeBatch(fb.db); }
+    }
+    for (const id of removedIds) {
+      batch.delete(fb.doc(fb.db, FS_COLLECTION, id));
+      ops++;
+      if (ops % 400 === 0) { await batch.commit(); batch = fb.writeBatch(fb.db); }
+    }
+    if (ops % 400 !== 0) await batch.commit();
+
+    changed.forEach(({ asset, serialized }) => lastPushedById.set(asset.id, serialized));
+    removedIds.forEach((id) => lastPushedById.delete(id));
+    setSyncBadge("online", "Sincronizzato");
+  } catch (error) {
+    console.error("[firestore] flush failed", error);
+    setSyncBadge("error", "Errore salvataggio");
+    showToast("Errore di salvataggio: " + (error.code || error.message));
+  }
+}
+
+// Firestore documents must not carry leftover base64 data URLs: visuals live in
+// Storage and the document only keeps the download URL plus its Storage path.
+function stripLocalOnlyFields(asset) {
+  const copy = { ...asset };
+  if (typeof copy.visual === "string" && copy.visual.startsWith("data:")) {
+    copy.visual = "";
+    copy.visualName = "";
+    copy.visualPath = "";
+  }
+  return copy;
 }
 
 function loadAppState() {
@@ -280,7 +351,12 @@ function saveTeamNotes(value) {
   localStorage.setItem(notesStorageKey, value);
 }
 
+// init() runs after a successful login. The guard keeps a logout/login cycle from
+// binding every listener a second time.
+let initDone = false;
 function init() {
+  if (initDone) { render(); return; }
+  initDone = true;
   bindNavigation();
   bindActions();
   bindModal();
@@ -314,8 +390,11 @@ function bindActions() {
   });
 
   document.getElementById("resetData").addEventListener("click", () => {
-    const confirmed = window.confirm("Ripristinare i dati iniziali? Visual, note e modifiche locali andranno persi. L'operazione non si puo annullare.");
+    const confirmed = window.confirm("Ripristinare i dati iniziali? Visual, note e modifiche andranno persi PER TUTTO IL TEAM, non solo su questo computer. L'operazione non si puo annullare.");
     if (!confirmed) return;
+    // Remove the uploaded visuals from Storage as well, otherwise they stay in the
+    // bucket forever with nothing pointing at them.
+    assets.forEach((asset) => { if (asset.visualPath) deleteVisualFromStorage(asset.visualPath); });
     assets = structuredClone(seedAssets);
     selectedId = assets[0].id;
     lastPipelineImportAt = null;
@@ -665,7 +744,9 @@ function bindDetailControls(asset) {
     duplicateAsset(asset);
   });
   document.getElementById("removeVisual")?.addEventListener("click", () => {
-    update({ visual: "", visualName: "" });
+    const previousPath = asset.visualPath;
+    update({ visual: "", visualName: "", visualPath: "" });
+    if (previousPath) deleteVisualFromStorage(previousPath);
     renderDetail(asset);
     showToast("Visual rimosso.");
   });
@@ -679,7 +760,9 @@ function deleteAsset(asset) {
 
   const index = assets.findIndex((item) => item.id === asset.id);
   if (index === -1) return;
+  const orphanedVisualPath = asset.visualPath;
   assets.splice(index, 1);
+  if (orphanedVisualPath) deleteVisualFromStorage(orphanedVisualPath);
 
   if (selectedId === asset.id) {
     selectedId = assets[0]?.id || null;
@@ -782,11 +865,22 @@ function handleAssetSubmit(event) {
   };
 
   if (file && file.size) {
-    compressImage(file).then((dataUrl) => {
-      asset.visual = dataUrl || "";
-      asset.visualName = file.name;
-      finish();
-    });
+    setSyncBadge("syncing", "Caricamento visual…");
+    compressImage(file)
+      .then((dataUrl) => uploadVisualToStorage(dataUrl, file, asset.id))
+      .then(({ url, path }) => {
+        const previousPath = existingAsset?.visualPath;
+        asset.visual = url;
+        asset.visualName = file.name;
+        asset.visualPath = path;
+        if (previousPath && previousPath !== path) deleteVisualFromStorage(previousPath);
+        finish();
+      })
+      .catch((error) => {
+        console.error("[storage] upload failed", error);
+        setSyncBadge("error", "Errore upload visual");
+        showToast("Errore upload visual: " + (error.code || error.message));
+      });
   } else {
     finish();
   }
@@ -820,6 +914,7 @@ function buildAssetFromForm(formData, existingAsset = null) {
     performance: existingAsset?.performance || null,
     visual: existingAsset?.visual || "",
     visualName: existingAsset?.visualName || "",
+    visualPath: existingAsset?.visualPath || "",
     archived: existingAsset?.archived || false,
     pipelineTracked: existingAsset?.pipelineTracked || false,
     lastSeenImportAt: existingAsset?.lastSeenImportAt || null,
@@ -933,15 +1028,65 @@ function shortSlug(value, maxLength) {
 function handleVisualUpload(event, asset) {
   const file = event.target.files?.[0];
   if (!file) return;
-  compressImage(file).then((dataUrl) => {
-    asset.visual = dataUrl || "";
-    asset.visualName = file.name;
-    const saved = saveAssets();
-    render();
-    if (saved) {
+  setSyncBadge("syncing", "Caricamento visual…");
+  compressImage(file)
+    .then((dataUrl) => uploadVisualToStorage(dataUrl, file, asset.id))
+    .then(({ url, path }) => {
+      const previousPath = asset.visualPath;
+      asset.visual = url;
+      asset.visualName = file.name;
+      asset.visualPath = path;
+      if (previousPath && previousPath !== path) deleteVisualFromStorage(previousPath);
+      saveAssets();
+      render();
       showToast("Visual collegato alla riga.");
-    }
-  });
+    })
+    .catch((error) => {
+      console.error("[storage] upload failed", error);
+      setSyncBadge("error", "Errore upload visual");
+      showToast("Errore upload visual: " + (error.code || error.message));
+    });
+}
+
+// ---- Firebase Storage helpers ----
+function dataUrlToBlob(dataUrl) {
+  const [meta, base64] = String(dataUrl).split(",");
+  const mime = /:(.*?);/.exec(meta)?.[1] || "application/octet-stream";
+  const binary = atob(base64 || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+function extensionForBlob(blob, fallbackName = "") {
+  const fromName = /\.([a-z0-9]+)$/i.exec(fallbackName)?.[1];
+  const map = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif" };
+  return map[blob.type] || (fromName ? fromName.toLowerCase() : "jpg");
+}
+
+// Accepts the compressed data URL produced by compressImage(); falls back to the
+// original File if compression returned nothing.
+async function uploadVisualToStorage(dataUrl, originalFile, assetId) {
+  const fb = window.__firebase;
+  if (!fb) throw new Error("Firebase non pronto");
+  const blob = dataUrl ? dataUrlToBlob(dataUrl) : originalFile;
+  const ext = extensionForBlob(blob, originalFile?.name || "");
+  const path = `${STORAGE_PREFIX}/${assetId}-${Date.now()}.${ext}`;
+  const ref = fb.storageRef(fb.storage, path);
+  const snapshot = await fb.uploadBytes(ref, blob, { contentType: blob.type || "image/jpeg" });
+  const url = await fb.getDownloadURL(snapshot.ref);
+  return { url, path };
+}
+
+// Fire-and-forget: a missing file is not an error worth interrupting the user for.
+async function deleteVisualFromStorage(path) {
+  const fb = window.__firebase;
+  if (!fb || !path) return;
+  try {
+    await fb.deleteObject(fb.storageRef(fb.storage, path));
+  } catch (error) {
+    console.warn("[storage] delete failed", path, error.code || error.message);
+  }
 }
 
 function compressImage(file, maxDimension = 1600, quality = 0.82) {
@@ -1961,8 +2106,13 @@ function mergeDuplicatePair(keepId, mergeId) {
 
   // Additive merge only: the kept asset never loses a visual, note or performance
   // it already has — it only fills in what it's missing from the duplicate.
-  keep.visual = keep.visual || merge.visual;
-  keep.visualName = keep.visualName || merge.visualName;
+  if (!keep.visual && merge.visual) {
+    keep.visual = merge.visual;
+    keep.visualName = merge.visualName;
+    // Take ownership of the Storage file too, otherwise deleting the merged asset
+    // later would orphan (or worse, delete) a visual the kept asset is now using.
+    keep.visualPath = merge.visualPath;
+  }
   keep.performance = keep.performance || merge.performance;
   keep.naming = keep.naming || merge.naming;
   if (merge.notes && merge.notes !== keep.notes) {
@@ -2179,4 +2329,225 @@ function updateHealthBadges() {
   els.metaBadge.style.display = metaCount ? "grid" : "none";
 }
 
-init();
+// ============================================================================
+// AUTH + FIRESTORE BOOT
+// ============================================================================
+function setSyncBadge(state, label) {
+  const badge = document.getElementById("syncBadge");
+  if (!badge) return;
+  badge.classList.remove("online", "offline", "error", "syncing");
+  if (state) badge.classList.add(state);
+  const labelEl = document.getElementById("syncLabel");
+  if (labelEl) labelEl.textContent = label;
+}
+
+function showAuthScreen() {
+  document.getElementById("authScreen").hidden = false;
+  document.getElementById("appShell").hidden = true;
+}
+
+function hideAuthScreen() {
+  document.getElementById("authScreen").hidden = true;
+  document.getElementById("appShell").hidden = false;
+}
+
+function showAuthError(message) {
+  const el = document.getElementById("authError");
+  el.textContent = message;
+  el.hidden = false;
+}
+
+function hideAuthError() {
+  document.getElementById("authError").hidden = true;
+}
+
+function updateUserBadge(user) {
+  const badge = document.getElementById("userBadge");
+  const email = document.getElementById("userEmail");
+  if (user) {
+    badge.hidden = false;
+    email.textContent = user.email;
+  } else {
+    badge.hidden = true;
+    email.textContent = "";
+  }
+}
+
+async function doLogin() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  hideAuthError();
+  try {
+    const provider = new fb.GoogleAuthProvider();
+    provider.setCustomParameters({ hd: ALLOWED_DOMAIN, prompt: "select_account" });
+    await fb.signInWithPopup(fb.auth, provider);
+  } catch (error) {
+    console.error("[auth] login failed", error);
+    if (error.code === "auth/popup-closed-by-user" || error.code === "auth/cancelled-popup-request") return;
+    if (error.code === "auth/popup-blocked") {
+      showAuthError("Il popup e stato bloccato dal browser. Consenti i popup per questo sito e riprova.");
+    } else if (error.code === "auth/unauthorized-domain") {
+      showAuthError("Dominio non autorizzato in Firebase Auth. Contatta il team Tech.");
+    } else {
+      showAuthError("Errore durante il login: " + (error.code || error.message));
+    }
+  }
+}
+
+async function doLogout() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  try { await fb.signOut(fb.auth); }
+  catch (error) { console.error("[auth] logout failed", error); }
+}
+
+function stopFirestoreListener() {
+  if (firestoreUnsub) { firestoreUnsub(); firestoreUnsub = null; }
+}
+
+function startFirestoreListener() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  setSyncBadge("syncing", "Sincronizzazione…");
+  firestoreUnsub = fb.onSnapshot(
+    fb.collection(fb.db, FS_COLLECTION),
+    { includeMetadataChanges: true },
+    async (snapshot) => {
+      // Empty collection on first load: populate it from this browser's local data
+      // (migration) or from the built-in seed.
+      if (!firstSnapshotSeen && snapshot.empty && !seedInFlight) {
+        seedInFlight = true;
+        try { await runFirstTimeSeed(); }
+        finally { seedInFlight = false; }
+        return; // the seed writes trigger a fresh snapshot
+      }
+      firstSnapshotSeen = true;
+
+      const incoming = [];
+      snapshot.forEach((docSnap) => incoming.push(normalizeAssetDefaults(docSnap.data())));
+      incoming.sort((a, b) => seedOrderWeight(a.id) - seedOrderWeight(b.id));
+      assets = incoming;
+      // Remember what the server holds so the next flush only sends real changes.
+      lastPushedById = new Map(assets.map((a) => [a.id, JSON.stringify(stripLocalOnlyFields(a))]));
+      if (!assets.some((a) => a.id === selectedId)) selectedId = assets[0]?.id || null;
+
+      if (snapshot.metadata.hasPendingWrites) setSyncBadge("syncing", "Salvataggio…");
+      else if (snapshot.metadata.fromCache) setSyncBadge("offline", navigator.onLine ? "Connessione al server…" : "Offline · dati locali");
+      else setSyncBadge("online", "Sincronizzato");
+
+      populateFilters();
+      render();
+    },
+    (error) => {
+      console.error("[firestore] listener error", error);
+      setSyncBadge("error", "Errore sync");
+      showToast("Errore di sincronizzazione: " + (error.code || error.message));
+    }
+  );
+}
+
+// Seed assets use ids like "asset-1".."asset-30"; assets created at runtime use an
+// epoch-based id. Sorting on that number keeps the original pipeline order stable
+// instead of letting Firestore's document-id ordering shuffle the table.
+function seedOrderWeight(id) {
+  const match = /^asset-(\d+)/.exec(id || "");
+  if (!match) return Number.MAX_SAFE_INTEGER;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+}
+
+// Runs once, when the Firestore collection is still empty. Uploads any base64
+// visual found in localStorage to Storage so nothing is lost in the move.
+async function runFirstTimeSeed() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  setSyncBadge("syncing", "Migrazione dati…");
+  const local = loadLocalAssets();
+  const prepared = [];
+  let migratedVisuals = 0;
+
+  for (const asset of local) {
+    let visual = asset.visual || "";
+    let visualPath = asset.visualPath || "";
+    if (visual.startsWith("data:")) {
+      try {
+        const uploaded = await uploadVisualToStorage(visual, { name: asset.visualName || "visual.jpg" }, asset.id);
+        visual = uploaded.url;
+        visualPath = uploaded.path;
+        migratedVisuals++;
+      } catch (error) {
+        console.warn("[migration] visual upload failed for", asset.id, error);
+        visual = "";
+        visualPath = "";
+      }
+    }
+    prepared.push({ ...asset, visual, visualPath });
+  }
+
+  try {
+    let batch = fb.writeBatch(fb.db);
+    let ops = 0;
+    for (const asset of prepared) {
+      batch.set(fb.doc(fb.db, FS_COLLECTION, asset.id), stripLocalOnlyFields(asset));
+      ops++;
+      if (ops % 400 === 0) { await batch.commit(); batch = fb.writeBatch(fb.db); }
+    }
+    if (ops % 400 !== 0) await batch.commit();
+    showToast(`Dati caricati su Firebase: ${prepared.length} asset${migratedVisuals ? `, ${migratedVisuals} visual migrati` : ""}.`);
+  } catch (error) {
+    console.error("[migration] seed failed", error);
+    setSyncBadge("error", "Errore migrazione");
+    showToast("Errore durante la migrazione: " + (error.code || error.message));
+  }
+}
+
+function bootFirebaseAuth() {
+  const fb = window.__firebase;
+  if (!fb) return;
+  document.getElementById("btnLogin").addEventListener("click", doLogin);
+  document.getElementById("btnLogout").addEventListener("click", doLogout);
+
+  fb.onAuthStateChanged(fb.auth, async (user) => {
+    if (!user) {
+      currentUser = null;
+      updateUserBadge(null);
+      stopFirestoreListener();
+      assets = [];
+      selectedId = null;
+      firstSnapshotSeen = false;
+      lastPushedById = new Map();
+      showAuthScreen();
+      return;
+    }
+
+    // The hd parameter is only a hint on the Google side, so the domain is checked
+    // here as well — and enforced for real by the Firestore/Storage rules.
+    const email = user.email || "";
+    if (!email.toLowerCase().endsWith("@" + ALLOWED_DOMAIN) || !user.emailVerified) {
+      console.warn("[auth] rejecting", email, "verified =", user.emailVerified);
+      try { await fb.signOut(fb.auth); } catch { /* già disconnesso */ }
+      showAuthScreen();
+      showAuthError(`Solo gli account @${ALLOWED_DOMAIN} verificati possono accedere. Hai effettuato il login con ${email || "(email non disponibile)"}.`);
+      return;
+    }
+
+    hideAuthError();
+    currentUser = user;
+    updateUserBadge(user);
+    hideAuthScreen();
+    init();
+    startFirestoreListener();
+  });
+}
+
+if (window.__firebase) {
+  bootFirebaseAuth();
+} else {
+  window.addEventListener("firebase-ready", bootFirebaseAuth, { once: true });
+  setTimeout(() => {
+    if (!window.__firebase) {
+      showAuthScreen();
+      showAuthError("Non e stato possibile caricare Firebase. Ricarica la pagina.");
+    }
+  }, 10000);
+}
