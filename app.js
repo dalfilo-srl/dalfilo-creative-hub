@@ -1769,7 +1769,13 @@ function findCsvHeaderIndex(lines) {
     // A real Meta Ads Manager export never has "asset"/"format" columns — its header
     // row instead always carries an ad name plus a spend/results metric. Recognizing
     // that shape too means the same CSV parser handles both import types.
-    const hasAdName = headers.some((header) => header.includes("ad name") || header.includes("ad_name") || header.includes("nome inserzione"));
+    //
+    // The Italian export labels the column "Nome dell'inserzione", so a substring
+    // test for "nome inserzione" never fired and the whole file was read as having
+    // no header at all — which surfaced as "0 asset matchati" with no explanation.
+    // Matching on "inserzione" alone covers every wording; the metric check below
+    // is what actually keeps a non-Meta file from being misread as one.
+    const hasAdName = headers.some((header) => header.includes("ad name") || header.includes("ad_name") || header.includes("inserzione"));
     const hasMetaMetric = headers.some((header) => header.includes("amount spent") || header.includes("impressions") || header.includes("cost per result") || header.includes("spesa") || header.includes("risultati"));
     const isMetaHeader = hasAdName && hasMetaMetric;
 
