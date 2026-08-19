@@ -1482,7 +1482,7 @@ function handleMetaCsvImport(event) {
   reader.readAsText(file);
 }
 
-const META_ADNAME_CANDIDATES = ["ad name", "ad_name", "ad", "nome inserzione", "inserzione"];
+const META_ADNAME_CANDIDATES = ["ad name", "ad_name", "nome dell'inserzione", "nome inserzione", "inserzione", "ad"];
 
 function applyMetaRows(rows, fileName) {
   const matchedAssetIds = new Set();
@@ -1529,13 +1529,15 @@ function findAssetByAdName(adName) {
 }
 
 function normalizePerformance(row, adName, fileName) {
-  const spend = parseNumber(findValue(row, ["amount spent", "spend", "importo speso", "spesa"]));
-  const impressions = parseNumber(findValue(row, ["impressions", "impression", "visualizzazioni"]));
-  const cpm = parseNumber(findValue(row, ["cpm", "cpm (cost per 1,000 impressions)"]));
-  const ctr = parseNumber(findValue(row, ["ctr", "ctr (link click-through rate)", "link ctr"]));
+  const spend = parseNumber(findValue(row, ["amount spent", "spend", "importo speso (eur)", "importo speso", "spesa"]));
+  const impressions = parseNumber(findValue(row, ["impressions", "impression", "impressioni", "visualizzazioni"]));
+  const cpm = parseNumber(findValue(row, ["cpm", "cpm (cost per 1,000 impressions)", "cpm (costo per 1000 impression)"]));
+  const ctr = parseNumber(findValue(row, ["ctr (link click-through rate)", "ctr (tasso di clic sul link)", "link ctr", "ctr"]));
   const results = parseNumber(findValue(row, ["results", "risultati", "website purchases", "purchases", "acquisti"]));
-  const cpr = parseNumber(findValue(row, ["cost per result", "costo per risultato", "cost per purchase", "cpa"]));
-  const video25 = parseNumber(findValue(row, ["video plays at 25%", "video played at 25%", "25% video plays", "video 25%"]));
+  // Meta's Italian export pluralises this one ("Costo per risultati"), which the
+  // singular candidate alone did not match.
+  const cpr = parseNumber(findValue(row, ["cost per result", "costo per risultati", "costo per risultato", "cost per purchase", "costo per acquisto", "cpa"]));
+  const video25 = parseNumber(findValue(row, ["video plays at 25%", "video played at 25%", "25% video plays", "video 25%", "riproduzioni video al 25%", "visualizzazioni del video al 25%"]));
   const badge = performanceBadge({ spend, results, cpr });
 
   return {
@@ -1741,14 +1743,37 @@ function findCsvHeaderIndex(lines) {
   });
 }
 
+// Header matching for imported CSVs. Meta exports headers in the account language,
+// so an exact hit is the exception rather than the rule and some fuzziness is
+// required — but naive fuzziness silently picks the wrong column.
+//
+// The previous version also tested `candidate.includes(rowKey)`, which let a long
+// candidate swallow an unrelated short header: the candidate
+// "cpm (cost per 1,000 impressions)" contains "impression", so an Italian export
+// with an "Impression" column had its impressions value imported as the CPM.
+// That direction is gone; matches now run header-side only and are scored, so the
+// most specific candidate wins instead of whichever happened to come first.
+const MIN_FUZZY_HEADER_LENGTH = 3;
+
 function findValue(row, candidates) {
   const normalizedCandidates = candidates.map(normalizeHeader);
-  const key = normalizedCandidates.find((candidate) => row[candidate] !== undefined && row[candidate] !== "");
-  if (key) return row[key];
+  const exactKey = normalizedCandidates.find((candidate) => row[candidate] !== undefined && row[candidate] !== "");
+  if (exactKey) return row[exactKey];
 
   const rowKeys = Object.keys(row).filter((rowKey) => rowKey !== "__cells" && row[rowKey] !== "");
-  const fuzzyKey = rowKeys.find((rowKey) => normalizedCandidates.some((candidate) => rowKey.includes(candidate) || candidate.includes(rowKey)));
-  return fuzzyKey ? row[fuzzyKey] : "";
+  let best = null;
+  for (const candidate of normalizedCandidates) {
+    if (candidate.length < MIN_FUZZY_HEADER_LENGTH) continue;
+    for (const rowKey of rowKeys) {
+      let score;
+      if (rowKey === candidate) score = 1000;
+      else if (rowKey.startsWith(candidate)) score = 500 + candidate.length;
+      else if (rowKey.includes(candidate)) score = 100 + candidate.length;
+      else continue;
+      if (!best || score > best.score) best = { rowKey, score };
+    }
+  }
+  return best ? row[best.rowKey] : "";
 }
 
 function normalizeHeader(value) {
