@@ -1239,7 +1239,7 @@ function renderPerformanceInsights() {
   const totalSpend = matched.reduce((sum, asset) => sum + (asset.performance.spend || 0), 0);
   const top = [...matched].sort((a, b) => (b.performance.spend || 0) - (a.performance.spend || 0)).slice(0, 3);
 
-  summary.textContent = `${matched.length} asset matchati · ${formatMetric(totalSpend, "currency")} spend`;
+  summary.textContent = `${matched.length} asset con performance · ${formatMetric(totalSpend, "currency")} di spesa`;
   container.innerHTML = `
     <article class="performance-card">
       <strong>${winners} winner · ${watch} da osservare · ${pause} da pausare</strong>
@@ -1310,7 +1310,24 @@ function handlePipelineCsvImport(event) {
     const rows = parseCsv(String(reader.result || ""));
     const importTimestamp = new Date().toISOString();
     const campaignsSeen = [...new Set(rows.map((row) => findValue(row, CAMPAIGN_HEADER_CANDIDATES)).filter(Boolean))];
+
+    // An import that applies to nothing is almost always the wrong file (a Meta
+    // export, an empty sheet, the wrong tab). Committing its timestamp anyway used
+    // to mark every existing asset as "missing from the latest CSV", turning one
+    // mistaken click into dozens of false anomalies. Refuse instead.
+    if (!rows.length) {
+      showToast("Nessuna riga trovata nel file: controlla di aver esportato il tab ADV Pipeline. Import annullato.");
+      els.pipelineCsvInput.value = "";
+      return;
+    }
+
     const result = applyPipelineRows(rows, importTimestamp);
+    if (result.created === 0 && result.updated === 0) {
+      showToast(`${rows.length} righe lette ma nessuna utilizzabile: probabilmente non è il CSV del tab ADV Pipeline. Import annullato.`);
+      els.pipelineCsvInput.value = "";
+      return;
+    }
+
     lastPipelineImportAt = importTimestamp;
     lastImportCampaigns = campaignsSeen;
     lastPipelineImportStats = { rows: rows.length, created: result.created, updated: result.updated };
@@ -1467,12 +1484,29 @@ function handleMetaCsvImport(event) {
   const reader = new FileReader();
   reader.onload = () => {
     const rows = parseCsv(String(reader.result || ""));
+    if (!rows.length) {
+      showToast("Nessuna riga trovata nel file. Import annullato.");
+      els.metaCsvInput.value = "";
+      return;
+    }
+    // Without an ad-name column there is nothing to match on, and applying the file
+    // would only wipe the existing list of unmatched rows.
+    const hasAdNameColumn = rows.some((row) => findValue(row, META_ADNAME_CANDIDATES));
+    if (!hasAdNameColumn) {
+      showToast("Colonna con il nome dell'inserzione non trovata: controlla di aver esportato il report inserzioni da Meta. Import annullato.");
+      els.metaCsvInput.value = "";
+      return;
+    }
     const result = applyMetaRows(rows, file.name);
     lastMetaImportStats = { rows: rows.length, matched: result.matched, unmatched: result.unmatched };
     const saved = saveAssets();
     render();
     if (saved) {
-      showToast(`${result.matched} asset matchati da ${file.name}${result.unmatched ? ` · ${result.unmatched} righe senza corrispondenza` : ""}.`);
+      showToast(
+        result.matched
+          ? `Performance collegate a ${result.matched} asset da ${file.name}${result.unmatched ? ` · ${result.unmatched} righe senza corrispondenza` : ""}.`
+          : `Nessun asset collegato: le ${result.unmatched} righe di ${file.name} non corrispondono al naming degli asset. Aprile dal Meta Check per collegarle a mano.`
+      );
       if (result.unmatched > 0) {
         setTimeout(openMetaModal, 500);
       }
